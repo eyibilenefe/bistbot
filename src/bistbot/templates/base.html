@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}BISTBot{% endblock %}</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body data-page="{{ page }}">
+    <div class="loading-overlay is-hidden" data-loading-overlay>
+      <div class="loading-card">
+        <div class="loading-spinner" aria-hidden="true"></div>
+        <strong>Veriler hazirlaniyor</strong>
+        <div class="loading-progress-track" aria-hidden="true">
+          <span class="loading-progress-bar" data-loading-progress-bar></span>
+        </div>
+        <div class="loading-progress-copy" data-loading-percent>%0</div>
+        <p data-loading-message>Onbellek kontrol ediliyor ve grafikler yukleniyor...</p>
+      </div>
+    </div>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">BIST Kantitatif Arastirma Platformu</p>
+          <h1>BISTBot</h1>
+          <p class="hero-text">
+            Yalnizca manuel islem. Gercek zamanli BIST verisi, 2 yillik backtest ve disiplinli portfoy riski.
+          </p>
+        </div>
+        <nav class="top-nav" aria-label="Ana Menu">
+          <a class="{% if page == 'dashboard' %}active{% endif %}" href="/dashboard">Panel</a>
+          <a class="{% if page == 'backtest' %}active{% endif %}" href="/backtest">Backtest</a>
+          <button type="button" class="ghost-link button-reset" data-refresh-cache>Veriyi Guncelle</button>
+          <a href="/docs">API Dokumani</a>
+        </nav>
+      </header>
+
+      <main class="content">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </body>
+</html>

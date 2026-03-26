@@ -1,0 +1,290 @@
+{% extends "base.html" %}
+
+{% block title %}BISTBot Panel{% endblock %}
+
+{% block content %}
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Toplam Deger</span>
+      <strong>{{ overview.total_value }} TRY</strong>
+    </article>
+    <article class="stat-card">
+      <span>Simule Getiri</span>
+      <strong>{{ overview.simulated_return_pct }}%</strong>
+    </article>
+    <article class="stat-card">
+      <span>Aktif Fikir</span>
+      <strong>{{ overview.active_ideas }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Acik Pozisyon</span>
+      <strong>{{ overview.open_positions }}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Yukleme Durumu</p>
+        <h2>Onbellek ve guncelleme</h2>
+      </div>
+      <span class="pill">
+        {% if research_cached_at %}
+          Son arastirma onbellegi {{ research_cached_at }}
+        {% else %}
+          Henuz kalici arastirma onbellegi yok
+        {% endif %}
+      </span>
+    </div>
+    <p class="panel-copy">
+      Uygulama yeniden acildiginda tum gecmisi bastan indirmek yerine disk onbellekten yuklenir.
+      "Veriyi Guncelle" dugmesi yalnizca eksik yeni veriyi cekip arastirma snapshot'unu yeniler.
+    </p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Canli BIST Izleme Listesi</p>
+        <h2>Gercek piyasa ozeti</h2>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Hisse</th>
+            <th>Sektor</th>
+            <th>Kapanis</th>
+            <th>Degisim</th>
+            <th>Yuksek</th>
+            <th>Dusuk</th>
+            <th>Hacim</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in market_watchlist %}
+            <tr>
+              <td>{{ row.symbol }}</td>
+              <td>{{ row.sector }}</td>
+              <td>{{ row.close }}</td>
+              <td>{{ row.change_pct }}%</td>
+              <td>{{ row.high }}</td>
+              <td>{{ row.low }}</td>
+              <td>{{ row.volume }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7">Su anda gercek BIST ozeti alinamadi.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Yuksek Guvenli Kurulumlar</p>
+        <h2>Yalnizca en iyi 2-3 fikir</h2>
+      </div>
+      <a class="ghost-link" href="/api/setups/top">Ham JSON</a>
+    </div>
+    <div class="setup-grid">
+      {% for setup in top_setups %}
+        <article class="setup-card">
+          <div class="setup-title">
+            <div>
+              <h3>{{ setup.symbol }}</h3>
+              <p>{{ setup.strategy_name }} · {{ setup.sector }}</p>
+            </div>
+            <span class="pill">{{ setup.strategy_family_label }}</span>
+          </div>
+          <dl class="metric-row">
+            <div><dt>Skor</dt><dd>{{ setup.score }}</dd></div>
+            <div><dt>Uyum</dt><dd>{{ setup.confluence_score }}</dd></div>
+            <div><dt>Beklenen R</dt><dd>{{ setup.expected_r }}</dd></div>
+            <div><dt>Risk/Odul</dt><dd>{{ setup.risk_reward }}</dd></div>
+          </dl>
+          <div class="range-block">
+            <p>Giris Bolgesi</p>
+            <strong>{{ setup.entry_low }} - {{ setup.entry_high }}</strong>
+          </div>
+          <div class="range-split">
+            <div>
+              <span>Stop</span>
+              <strong>{{ setup.stop }}</strong>
+            </div>
+            <div>
+              <span>Hedef</span>
+              <strong>{{ setup.target }}</strong>
+            </div>
+            <div>
+              <span>Kalan Sure</span>
+              <strong>{{ setup.expires_in_hours }}h</strong>
+            </div>
+          </div>
+          <div class="thesis-block">
+            <span>Neden Secildi</span>
+            <p>{{ setup.thesis }}</p>
+          </div>
+        </article>
+      {% else %}
+        <p class="empty-state">Henuz gercek setup verisi olusmadi.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="two-col">
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Aktif Islem Fikirleri</p>
+          <h2>Acik pozisyonlar</h2>
+        </div>
+        <a class="ghost-link" href="/api/positions">Ham JSON</a>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Hisse</th>
+              <th>Giris</th>
+              <th>Son</th>
+              <th>Stop</th>
+              <th>Hedef</th>
+              <th>Adet</th>
+              <th>Giris Gerekcesi</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for position in positions %}
+              <tr>
+                <td>{{ position.symbol }}</td>
+                <td>{{ position.entry_price }}</td>
+                <td>{{ position.last_price }}</td>
+                <td>{{ position.stop_price }}</td>
+                <td>{{ position.target_price }}</td>
+                <td>{{ position.quantity }}</td>
+                <td class="reason-cell">{{ position.entry_reason }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="7">Henuz acik pozisyon yok.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Strateji Icgoruleri</p>
+          <h2>En iyi ve en zayiflar</h2>
+        </div>
+      </div>
+      <div class="insight-columns">
+        <div>
+          <h3>En Iyiler</h3>
+          <ul class="insight-list">
+            {% for item in strategy_insights.best %}
+              <li>
+                <strong>{{ item.name }}</strong>
+                <span>{{ item.cluster_id }} · score {{ item.composite_score }}</span>
+              </li>
+            {% else %}
+              <li><span>Henuz gercek strateji icgorusu yok.</span></li>
+            {% endfor %}
+          </ul>
+        </div>
+        <div>
+          <h3>En Zayiflar</h3>
+          <ul class="insight-list">
+            {% for item in strategy_insights.worst %}
+              <li>
+                <strong>{{ item.name }}</strong>
+                <span>{{ item.cluster_id }} · score {{ item.composite_score }}</span>
+              </li>
+            {% else %}
+              <li><span>Henuz gercek strateji icgorusu yok.</span></li>
+            {% endfor %}
+          </ul>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Canli Islem Haritasi</p>
+        <h2>Giris noktali gercek mum grafikleri</h2>
+      </div>
+    </div>
+    <div class="chart-grid">
+      {% for chart in live_trade_charts %}
+        <article class="chart-card">
+          <div class="chart-head">
+            <div>
+              <h3>{{ chart.title }}</h3>
+              <p>{{ chart.subtitle }}</p>
+            </div>
+            <span class="pill">{{ chart.quantity }} lot · {{ chart.data_source }}</span>
+          </div>
+          <p class="chart-thesis">{{ chart.entry_reason }}</p>
+          <div class="tv-chart" aria-label="{{ chart.title }}"></div>
+          <script type="application/json" class="chart-payload">{{ chart | tojson }}</script>
+          <div class="chart-footer">
+            <span>{{ chart.start_label }}</span>
+            <span>Son {{ chart.last_price }}</span>
+            <span>{{ chart.end_label }}</span>
+          </div>
+        </article>
+      {% else %}
+        <p class="empty-state">Acik pozisyon olmadigi icin gercek canli mum grafigi gosterilemiyor.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Tum Hisseler</p>
+        <h2>Sembol secerek anlik grafik ac</h2>
+      </div>
+      <span class="pill">{{ available_symbols | length }} sembol</span>
+    </div>
+    <div class="symbol-browser" data-market-browser>
+      <label class="field-label" for="market-symbol-input">Hisse Sec</label>
+      <div class="symbol-browser-controls">
+        <input
+          id="market-symbol-input"
+          class="symbol-input"
+          type="text"
+          list="market-symbol-options"
+          value="{{ featured_symbol or '' }}"
+          placeholder="Orn. AKBNK"
+          data-market-symbol-input
+        >
+        <datalist id="market-symbol-options">
+          {% for symbol in available_symbols %}
+            <option value="{{ symbol }}"></option>
+          {% endfor %}
+        </datalist>
+        <button type="button" class="ghost-link button-reset" data-market-symbol-load>Grafik Yukle</button>
+      </div>
+      <p class="symbol-browser-status" data-market-symbol-status>
+        Tum hisseler icin grafik burada olusur. Bir sembol sec ve yukle.
+      </p>
+      <article class="chart-card chart-browser-card" data-dynamic-chart="true">
+        <div class="chart-head">
+          <div>
+            <h3 data-market-chart-title>Secilen hisse</h3>
+            <p data-market-chart-subtitle>Gunluk mum verisi ve mevcut onbellek bilgisi burada gosterilecek.</p>
+          </div>
+          <span class="pill" data-market-chart-meta>Hazir bekliyor</span>
+        </div>
+        <div class="tv-chart" aria-label="Tum hisseler piyasa grafigi" data-market-chart-container></div>
+      </article>
+    </div>
+  </section>
+{% endblock %}

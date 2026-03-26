@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+
+{% block title %}BISTBot Backtest{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Backtest Kumeleme</p>
+        <h2>Gercek veri kume siralamasi</h2>
+      </div>
+      <a class="ghost-link" href="/api/backtests/clusters">Ham JSON</a>
+    </div>
+    <p class="panel-copy">
+      {% if research_cached_at %}
+        Son arastirma onbellegi {{ research_cached_at }} zamaninda yuklendi.
+      {% else %}
+        Arastirma snapshot'u ilk uygun istekte olusturulacak.
+      {% endif %}
+    </p>
+    <div class="cluster-stack">
+      {% for cluster in clusters %}
+        <article class="cluster-card">
+          <div class="cluster-head">
+            <div>
+              <h3>{{ cluster.id }}</h3>
+              <p>{{ cluster.symbol_count }} hisse · fallback {{ cluster.fallback_mode }}</p>
+            </div>
+            <span class="pill">ortalama skor {{ cluster.avg_score }}</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Strateji</th>
+                  <th>Aile</th>
+                  <th>Getiri</th>
+                  <th>Kazanma</th>
+                  <th>PF</th>
+                  <th>Maks DD</th>
+                  <th>Skor</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for strategy in cluster.top_strategies %}
+                  <tr>
+                    <td>{{ strategy.name }}</td>
+                    <td>{{ strategy.family }}</td>
+                    <td>{{ strategy.return }}%</td>
+                    <td>{{ strategy.win_rate }}%</td>
+                    <td>{{ strategy.profit_factor }}</td>
+                    <td>{{ strategy.max_drawdown }}%</td>
+                    <td>{{ strategy.composite_score }}</td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="7">Henuz strateji siralamasi yok.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      {% else %}
+        <p class="empty-state">Henuz gercek backtest kume verisi olusmadi.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="two-col">
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">En Basarili Hisseler</p>
+          <h2>Hisse bazli backtest ozeti</h2>
+        </div>
+        <span class="pill">{{ top_backtest_symbols | length }} hisse</span>
+      </div>
+      <ul class="trade-list">
+        {% for item in top_backtest_symbols %}
+          <li>
+            <strong>{{ item.symbol }}</strong>
+            <span>{{ item.sector }} · {{ item.trade_count }} islem · {{ item.strategy_count }} strateji</span>
+            <span>{{ item.total_return_pct }}% getiri · {{ item.avg_r }}R ortalama · {{ item.win_rate }}% kazanma</span>
+          </li>
+        {% else %}
+          <li><span>Henuz hisse bazli backtest verisi yok.</span></li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Arastirma Nabzi</p>
+          <h2>Strateji dagilimi</h2>
+        </div>
+      </div>
+      <div class="insight-columns">
+        <div>
+          <h3>Liderler</h3>
+          <ul class="insight-list">
+            {% for item in strategy_insights.best %}
+              <li>
+                <strong>{{ item.name }}</strong>
+                <span>{{ item.return }}% return · PF {{ item.profit_factor }}</span>
+              </li>
+            {% else %}
+              <li><span>Henuz gercek strateji icgorusu yok.</span></li>
+            {% endfor %}
+          </ul>
+        </div>
+        <div>
+          <h3>Geride Kalanlar</h3>
+          <ul class="insight-list">
+            {% for item in strategy_insights.worst %}
+              <li>
+                <strong>{{ item.name }}</strong>
+                <span>{{ item.max_drawdown }}% max DD · score {{ item.composite_score }}</span>
+              </li>
+            {% else %}
+              <li><span>Henuz gercek strateji icgorusu yok.</span></li>
+            {% endfor %}
+          </ul>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Hisse Ara</p>
+        <h2>Istedigin hissenin backtestini ac</h2>
+      </div>
+      <span class="pill">{{ available_backtest_symbols | length }} backtest hissesi</span>
+    </div>
+    <div class="symbol-browser" data-backtest-browser>
+      <label class="field-label" for="backtest-symbol-input">Backtest Hissesi</label>
+      <div class="symbol-browser-controls">
+        <input
+          id="backtest-symbol-input"
+          class="symbol-input"
+          type="text"
+          list="backtest-symbol-options"
+          value="{{ featured_backtest_symbol or '' }}"
+          placeholder="Orn. AKBNK"
+          data-backtest-symbol-input
+        >
+        <datalist id="backtest-symbol-options">
+          {% for symbol in available_backtest_symbols %}
+            <option value="{{ symbol }}"></option>
+          {% endfor %}
+        </datalist>
+        <button type="button" class="ghost-link button-reset" data-backtest-symbol-load>Backtest Yukle</button>
+      </div>
+      <p class="symbol-browser-status" data-backtest-symbol-status>
+        Hisse secerek o sembolun 2 yillik backtest grafigini acabilirsin.
+      </p>
+      <article class="chart-card chart-browser-card" data-dynamic-chart="true">
+        <div class="chart-head">
+          <div>
+            <h3 data-backtest-chart-title>Secilen backtest hissesi</h3>
+            <p data-backtest-chart-subtitle>Tum stratejilerden gelen giris ve cikislar burada gosterilecek.</p>
+          </div>
+          <span class="pill" data-backtest-chart-meta>Hazir bekliyor</span>
+        </div>
+        <div class="tv-chart" aria-label="Backtest hisse grafigi" data-backtest-chart-container></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Tarihsel Trade Isaretleri</p>
+        <h2>En basarili hisseler icin minimum 2 yillik 4 saatlik mum analizi</h2>
+      </div>
+      <span class="pill">{{ trade_charts | length }} grafik</span>
+    </div>
+    <div class="chart-grid">
+      {% for chart in trade_charts %}
+        <article class="chart-card">
+          <div class="chart-head">
+            <div>
+              <h3>{{ chart.title }}</h3>
+              <p>{{ chart.subtitle }}</p>
+            </div>
+            <span class="pill">{{ chart.return_pct }}% · {{ chart.r_multiple }}R · {{ chart.data_source }}</span>
+          </div>
+          <div class="tv-chart" aria-label="{{ chart.title }}"></div>
+          <script type="application/json" class="chart-payload">{{ chart | tojson }}</script>
+          <div class="chart-footer">
+            <span>{{ chart.start_label }}</span>
+            <span>{{ chart.strategy_name }}</span>
+            <span>{{ chart.end_label }}</span>
+          </div>
+        </article>
+      {% else %}
+        <p class="empty-state">Gercek trade ureten 2 yillik backtest sonucuna henuz ulasilamadi.</p>
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}
