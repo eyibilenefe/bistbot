@@ -45,6 +45,8 @@ from bistbot.services.setup_lifecycle import (
 from bistbot.services.strategy_selection import select_active_strategies
 from bistbot.storage.disk_cache import DiskCache
 
+RESEARCH_STATE_SCHEMA_VERSION = 2
+
 
 class InMemoryStore:
     def __init__(
@@ -88,7 +90,7 @@ class InMemoryStore:
             self._load_cached_runtime_state()
             self._load_cached_research_state()
             self._load_real_symbol_metadata()
-            self._backfill_position_reasons()
+            self._backfill_position_metadata()
             self._bootstrap_paper_portfolio()
 
     def _seed_demo_data(self) -> None:
@@ -278,6 +280,8 @@ class InMemoryStore:
             ]
         )
         self.strategy_scores = {score.strategy_id: score for score in cluster_scores}
+        for score in self.strategy_scores.values():
+            score.walk_forward_window_count = len(score.oos_window_trade_counts)
 
         scores_by_cluster: dict[str, list[StrategyScore]] = {}
         for score in cluster_scores:
@@ -366,6 +370,7 @@ class InMemoryStore:
             adjusted_target_price=228.0,
         )
         self.positions[existing_position.id] = existing_position
+        self._backfill_position_metadata()
 
         self.backtest_trades = {
             "strat-trend-bank": [
@@ -623,6 +628,7 @@ class InMemoryStore:
             last_price=fill_price,
             opened_at=filled_at,
             entry_reason=self._build_position_entry_reason(setup=setup, fill_price=fill_price),
+            success_probability=self._resolve_position_success_probability(setup=setup),
             adjusted_entry_price=fill_price,
             adjusted_stop_price=setup.stop,
             adjusted_target_price=setup.target,
@@ -838,6 +844,7 @@ class InMemoryStore:
                 last_price=latest_bar.close,
                 opened_at=latest_bar.timestamp,
                 entry_reason=self._build_position_entry_reason(setup=setup, fill_price=fill_price),
+                success_probability=self._resolve_position_success_probability(setup=setup),
                 adjusted_entry_price=fill_price,
                 adjusted_stop_price=setup.stop,
                 adjusted_target_price=setup.target,
@@ -898,6 +905,11 @@ class InMemoryStore:
         self.cash_balance += exit_price * position.quantity
 
     def _enrich_setup(self, setup: SetupCandidate) -> SetupCandidate:
+        strategy_score = self.strategy_scores.get(setup.strategy_id)
+        if strategy_score is not None:
+            setup.wf_window_count = strategy_score.walk_forward_window_count
+            setup.wf_win_rate = round(strategy_score.win_rate * 100, 2)
+            setup.wf_total_return_pct = round(strategy_score.total_return * 100, 2)
         if not setup.thesis:
             setup.thesis = self._build_setup_thesis(setup)
         return setup
@@ -912,10 +924,17 @@ class InMemoryStore:
         trend = strategy.trend_indicator if strategy else "trend"
         momentum = strategy.momentum_indicator if strategy else "momentum"
         volume = strategy.volume_indicator if strategy else "hacim"
+        wf_clause = ""
+        if setup.wf_window_count > 0:
+            wf_clause = (
+                f" Walk-forward OOS dogrulamasi {setup.wf_window_count} pencere,"
+                f" {setup.wf_win_rate:.2f}% kazanma ve {setup.wf_total_return_pct:.2f}% getiri gosterdi."
+            )
         return (
             f"{family_label} stratejisi {cluster_label} kumesinde one cikti. "
             f"{trend}, {momentum} ve {volume} birlikte onay verdi; "
             f"uyum {setup.confluence_score:.2f}, skor {setup.score:.2f} ve beklenen getiri {setup.expected_r:.2f}R."
+            f"{wf_clause}"
         )
 
     def _build_position_entry_reason(
@@ -930,31 +949,60 @@ class InMemoryStore:
             f"stop {setup.stop:.2f}, hedef {setup.target:.2f} olarak yerlestirildi."
         )
 
-    def _backfill_position_reasons(self) -> None:
+    @staticmethod
+    def _normalize_probability(probability: float | None) -> float | None:
+        if probability is None:
+            return None
+        return max(0.0, min(float(probability), 1.0))
+
+    @staticmethod
+    def _format_probability_pct(probability: float | None) -> float | None:
+        if probability is None:
+            return None
+        return round(probability * 100, 1)
+
+    def _find_related_setup_for_symbol(self, symbol: str) -> SetupCandidate | None:
+        normalized_symbol = symbol.upper()
+        for preferred_status in (
+            SetupStatus.ENTERED,
+            SetupStatus.APPROVED_PENDING_ENTRY,
+            SetupStatus.ACTIVE,
+        ):
+            for setup in self.setups.values():
+                if setup.symbol == normalized_symbol and setup.status == preferred_status:
+                    return self._enrich_setup(setup)
+        return None
+
+    def _resolve_position_success_probability(
+        self,
+        *,
+        setup: SetupCandidate | None = None,
+        symbol: str | None = None,
+    ) -> float | None:
+        related_setup = setup
+        if related_setup is None and symbol is not None:
+            related_setup = self._find_related_setup_for_symbol(symbol)
+        if related_setup is None:
+            return None
+        return self._normalize_probability(related_setup.confidence)
+
+    def _backfill_position_metadata(self) -> None:
         if not self.positions:
             return
         for position in self.positions.values():
-            if position.entry_reason:
-                continue
-            related_setup = next(
-                (
-                    setup
-                    for setup in self.setups.values()
-                    if setup.symbol == position.symbol
-                ),
-                None,
-            )
-            if related_setup is not None:
-                related_setup = self._enrich_setup(related_setup)
+            related_setup = self._find_related_setup_for_symbol(position.symbol)
+            if not position.entry_reason and related_setup is not None:
                 position.entry_reason = self._build_position_entry_reason(
                     setup=related_setup,
                     fill_price=position.entry_price,
                 )
-                continue
-            position.entry_reason = (
-                f"Bot bu pozisyonu {position.sector} grubunda {position.entry_price:.2f} seviyesinden acti; "
-                f"stop {position.stop_price:.2f} ve hedef {position.target_price:.2f} ile risk/odul dengesi kuruldu."
-            )
+            elif not position.entry_reason:
+                position.entry_reason = (
+                    f"Bot bu pozisyonu {position.sector} grubunda {position.entry_price:.2f} seviyesinden acti; "
+                    f"stop {position.stop_price:.2f} ve hedef {position.target_price:.2f} ile risk/odul dengesi kuruldu."
+                )
+            if position.success_probability is None:
+                position.success_probability = self._resolve_position_success_probability(setup=related_setup)
 
     def _bootstrap_paper_portfolio(self) -> None:
         if not self.settings.auto_paper_trading_enabled:
@@ -1007,7 +1055,12 @@ class InMemoryStore:
                         for strategy_id in self.cluster_active_strategy_ids.get(cluster_id, [])
                         if self._is_visible_strategy(strategy_id)
                     ],
+                    "backtest_mode": "walk_forward",
                     "strategy_count": len(strategies),
+                    "walk_forward_window_count": max(
+                        (score.walk_forward_window_count for score in strategies),
+                        default=0,
+                    ),
                 }
             )
         return cluster_rows
@@ -1058,6 +1111,8 @@ class InMemoryStore:
                 "profit_factor": round(score.profit_factor, 2),
                 "max_drawdown": round(score.max_drawdown * 100, 2),
                 "trade_count": score.trade_count,
+                "walk_forward_window_count": score.walk_forward_window_count,
+                "backtest_mode": score.backtest_mode,
             }
 
         return {
@@ -1107,7 +1162,13 @@ class InMemoryStore:
                 }
                 for setup in top_setups
             ],
-            "positions": [asdict(position) for position in open_positions],
+            "positions": [
+                {
+                    **asdict(position),
+                    "success_probability_pct": self._format_probability_pct(position.success_probability),
+                }
+                for position in open_positions
+            ],
             "pending_setups": [
                 {
                     **asdict(setup),
@@ -1153,6 +1214,8 @@ class InMemoryStore:
                             "win_rate": round(score.win_rate * 100, 2),
                             "profit_factor": round(score.profit_factor, 2),
                             "max_drawdown": round(score.max_drawdown * 100, 2),
+                            "walk_forward_window_count": score.walk_forward_window_count,
+                            "backtest_mode": score.backtest_mode,
                         }
                         for score in strategies[:3]
                     ],
@@ -1299,6 +1362,7 @@ class InMemoryStore:
                 {
                     "symbol": symbol,
                     "sector": self.symbol_sectors.get(symbol, "unknown"),
+                    "backtest_mode": "walk_forward",
                     "trade_count": len(trades),
                     "strategy_count": len(strategies_by_symbol.get(symbol, set())),
                     "total_return_pct": round((compounded - 1) * 100, 2),
@@ -1307,6 +1371,14 @@ class InMemoryStore:
                         fmean(trade.r_multiple for trade in trades if trade.r_multiple is not None),
                         2,
                     ) if trades else 0.0,
+                    "walk_forward_window_count": max(
+                        (
+                            self.strategy_scores[strategy_id].walk_forward_window_count
+                            for strategy_id in strategies_by_symbol.get(symbol, set())
+                            if strategy_id in self.strategy_scores
+                        ),
+                        default=0,
+                    ),
                     "last_trade_at": max(trade.exited_at for trade in trades).isoformat(),
                 }
             )
@@ -1386,12 +1458,13 @@ class InMemoryStore:
 
         chart = build_candlestick_chart(
             symbol=normalized_symbol,
-            title=f"{normalized_symbol} 2 Yillik Backtest",
-            subtitle=f"Secilen hisse icin tum stratejilerden olusan tarihsel giris ve cikislar ({bars[-1].timeframe.upper()})",
+            title=f"{normalized_symbol} Walk-Forward OOS Backtest",
+            subtitle=f"Secilen hisse icin test pencerelerinden olusan OOS giris ve cikislar ({bars[-1].timeframe.upper()})",
             bars=bars[-self._backtest_chart_bar_limit(bars[-1].timeframe):],
             markers=markers,
         )
         chart["data_source"] = f"Yahoo Finance (.IS) · {bars[-1].timeframe.upper()}"
+        chart["backtest_mode"] = "walk_forward"
         chart["return_pct"] = round((compounded - 1) * 100, 2)
         chart["r_multiple"] = round(
             fmean(trade.r_multiple for trade in symbol_trades if trade.r_multiple is not None),
@@ -1399,6 +1472,15 @@ class InMemoryStore:
         ) if symbol_trades else 0.0
         chart["trade_count"] = len(symbol_trades)
         chart["strategy_count"] = len(strategy_names)
+        chart["walk_forward_window_count"] = max(
+            (
+                self.strategy_scores[strategy_id].walk_forward_window_count
+                for strategy_id in self.backtest_trades
+                if strategy_id in self.strategy_scores
+                and any(trade.symbol == normalized_symbol for trade in self.backtest_trades.get(strategy_id, []))
+            ),
+            default=0,
+        )
         chart["strategy_name"] = ", ".join(sorted(strategy_names)[:3])
         chart["entered_at"] = symbol_trades[0].entered_at.isoformat()
         chart["exited_at"] = symbol_trades[-1].exited_at.isoformat()
@@ -1530,7 +1612,7 @@ class InMemoryStore:
         self.cluster_active_strategy_ids = result.cluster_active_strategy_ids
         self.backtest_trades = result.backtest_trades
         self.setups = {setup.id: self._enrich_setup(setup) for setup in result.setups}
-        self._backfill_position_reasons()
+        self._backfill_position_metadata()
         self.research_cached_at = datetime.now(UTC)
         self._real_data_loaded = True
         self._real_data_attempted = True
@@ -1558,6 +1640,11 @@ class InMemoryStore:
                     last_price=float(item["last_price"]),
                     opened_at=datetime.fromisoformat(item["opened_at"]),
                     entry_reason=str(item.get("entry_reason", "")),
+                    success_probability=(
+                        self._normalize_probability(item["success_probability"])
+                        if item.get("success_probability") is not None
+                        else None
+                    ),
                     closed_at=datetime.fromisoformat(item["closed_at"]) if item.get("closed_at") else None,
                     adjustment_factor=float(item.get("adjustment_factor", 1.0)),
                     adjusted_entry_price=float(item["adjusted_entry_price"]) if item.get("adjusted_entry_price") is not None else None,
@@ -1592,6 +1679,7 @@ class InMemoryStore:
                     "last_price": position.last_price,
                     "opened_at": position.opened_at.isoformat(),
                     "entry_reason": position.entry_reason,
+                    "success_probability": position.success_probability,
                     "closed_at": position.closed_at.isoformat() if position.closed_at else None,
                     "adjustment_factor": position.adjustment_factor,
                     "adjusted_entry_price": position.adjusted_entry_price,
@@ -1613,6 +1701,8 @@ class InMemoryStore:
             return
         payload = self.disk_cache.load_research_state()
         if not payload:
+            return
+        if payload.get("research_state_schema_version") != RESEARCH_STATE_SCHEMA_VERSION:
             return
         if payload.get("research_timeframe") != self.settings.research_timeframe:
             return
@@ -1666,6 +1756,8 @@ class InMemoryStore:
                 estimated_round_trip_cost=float(item["estimated_round_trip_cost"]),
                 oos_window_trade_counts=[int(value) for value in item.get("oos_window_trade_counts", [])],
                 oos_returns=[float(value) for value in item.get("oos_returns", [])],
+                walk_forward_window_count=int(item.get("walk_forward_window_count", 0)),
+                backtest_mode=str(item.get("backtest_mode", "walk_forward")),
                 normalized_return=float(item.get("normalized_return", 0.0)),
                 normalized_win_rate=float(item.get("normalized_win_rate", 0.0)),
                 normalized_profit_factor=float(item.get("normalized_profit_factor", 0.0)),
@@ -1711,6 +1803,9 @@ class InMemoryStore:
                 expected_r=float(item["expected_r"]),
                 created_at=datetime.fromisoformat(item["created_at"]),
                 expires_at=datetime.fromisoformat(item["expires_at"]),
+                wf_window_count=int(item.get("wf_window_count", 0)),
+                wf_win_rate=float(item.get("wf_win_rate", 0.0)),
+                wf_total_return_pct=float(item.get("wf_total_return_pct", 0.0)),
                 thesis=str(item.get("thesis", "")),
                 status=SetupStatus(str(item.get("status", SetupStatus.ACTIVE.value))),
                 invalidated_reason=str(item["invalidated_reason"]) if item.get("invalidated_reason") else None,
@@ -1718,13 +1813,14 @@ class InMemoryStore:
             for item in payload.get("setups", [])
         }
         self.setups = {setup_id: self._enrich_setup(setup) for setup_id, setup in self.setups.items()}
-        self._backfill_position_reasons()
+        self._backfill_position_metadata()
         self._real_data_loaded = bool(self.strategy_scores)
 
     def _persist_research_state(self) -> None:
         if self.disk_cache is None:
             return
         payload = {
+            "research_state_schema_version": RESEARCH_STATE_SCHEMA_VERSION,
             "cached_at": self.research_cached_at.isoformat() if self.research_cached_at else None,
             "research_timeframe": self.settings.research_timeframe,
             "symbol_sectors": self.symbol_sectors,
@@ -1768,6 +1864,8 @@ class InMemoryStore:
                     "estimated_round_trip_cost": score.estimated_round_trip_cost,
                     "oos_window_trade_counts": score.oos_window_trade_counts,
                     "oos_returns": score.oos_returns,
+                    "walk_forward_window_count": score.walk_forward_window_count,
+                    "backtest_mode": score.backtest_mode,
                     "normalized_return": score.normalized_return,
                     "normalized_win_rate": score.normalized_win_rate,
                     "normalized_profit_factor": score.normalized_profit_factor,
@@ -1810,6 +1908,9 @@ class InMemoryStore:
                     "expected_r": setup.expected_r,
                     "created_at": setup.created_at.isoformat(),
                     "expires_at": setup.expires_at.isoformat(),
+                    "wf_window_count": setup.wf_window_count,
+                    "wf_win_rate": setup.wf_win_rate,
+                    "wf_total_return_pct": setup.wf_total_return_pct,
                     "thesis": setup.thesis,
                     "status": setup.status.value,
                     "invalidated_reason": setup.invalidated_reason,

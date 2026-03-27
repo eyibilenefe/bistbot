@@ -263,18 +263,18 @@ async function loadBacktestSymbolChart(symbol) {
 
   if (!trimmedSymbol) {
     if (status) {
-      status.textContent = 'Lutfen once backtest hissesi sec.';
+      status.textContent = 'Lutfen once walk-forward hissesi sec.';
     }
     return;
   }
 
   if (status) {
-    status.textContent = `${trimmedSymbol} backtesti yukleniyor...`;
+    status.textContent = `${trimmedSymbol} walk-forward OOS backtesti yukleniyor...`;
   }
-  setLoadingVisible(true, `${trimmedSymbol} icin backtest grafigi aliniyor...`);
-  setLoadingProgress(20, `${trimmedSymbol} icin backtest grafigi aliniyor...`);
+  setLoadingVisible(true, `${trimmedSymbol} icin walk-forward OOS grafigi aliniyor...`);
+  setLoadingProgress(20, `${trimmedSymbol} icin walk-forward OOS grafigi aliniyor...`);
   destroyChart(container);
-  container.innerHTML = '<div class="chart-empty">Backtest grafigi hazirlaniyor...</div>';
+  container.innerHTML = '<div class="chart-empty">Walk-forward OOS grafigi hazirlaniyor...</div>';
 
   try {
     await ensureChartLibrary();
@@ -288,22 +288,22 @@ async function loadBacktestSymbolChart(symbol) {
       title.textContent = payload.title || trimmedSymbol;
     }
     if (subtitle) {
-      subtitle.textContent = payload.subtitle || 'Backtest mum verisi';
+      subtitle.textContent = payload.subtitle || 'Walk-forward OOS mum verisi';
     }
     if (meta) {
-      meta.textContent = `${payload.trade_count || 0} islem · ${payload.return_pct ?? 0}% getiri · ${payload.data_source || 'Veri yok'}`;
+      meta.textContent = `${payload.trade_count || 0} OOS islem · ${payload.return_pct ?? 0}% getiri · ${payload.walk_forward_window_count || 0} pencere · ${payload.data_source || 'Veri yok'}`;
     }
     if (status) {
-      status.textContent = `${trimmedSymbol} backtesti yuklendi.`;
+      status.textContent = `${trimmedSymbol} walk-forward OOS backtesti yuklendi.`;
     }
-    setLoadingProgress(100, `${trimmedSymbol} backtest grafigi hazir.`);
+    setLoadingProgress(100, `${trimmedSymbol} walk-forward OOS grafigi hazir.`);
   } catch (error) {
     destroyChart(container);
-    container.innerHTML = '<div class="chart-empty">Bu hisse icin backtest grafigi bulunamadi.</div>';
+    container.innerHTML = '<div class="chart-empty">Bu hisse icin walk-forward OOS grafigi bulunamadi.</div>';
     if (status) {
-      status.textContent = `${trimmedSymbol} icin backtest kaydi bulunamadi.`;
+      status.textContent = `${trimmedSymbol} icin walk-forward OOS kaydi bulunamadi.`;
     }
-    setLoadingProgress(100, `${trimmedSymbol} icin backtest kaydi bulunamadi.`);
+    setLoadingProgress(100, `${trimmedSymbol} icin walk-forward OOS kaydi bulunamadi.`);
   } finally {
     window.setTimeout(() => {
       setLoadingVisible(false);

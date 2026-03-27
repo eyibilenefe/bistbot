@@ -13,7 +13,7 @@
     </div>
     <p class="panel-copy">
       {% if research_cached_at %}
-        Son arastirma onbellegi {{ research_cached_at }} zamaninda yuklendi.
+        Son walk-forward OOS arastirma onbellegi {{ research_cached_at }} zamaninda yuklendi.
       {% else %}
         Arastirma snapshot'u ilk uygun istekte olusturulacak.
       {% endif %}
@@ -34,10 +34,11 @@
                 <tr>
                   <th>Strateji</th>
                   <th>Aile</th>
-                  <th>Getiri</th>
-                  <th>Kazanma</th>
+                  <th>OOS Getiri</th>
+                  <th>OOS Kazanma</th>
                   <th>PF</th>
                   <th>Maks DD</th>
+                  <th>WF Pencere</th>
                   <th>Skor</th>
                 </tr>
               </thead>
@@ -50,10 +51,11 @@
                     <td>{{ strategy.win_rate }}%</td>
                     <td>{{ strategy.profit_factor }}</td>
                     <td>{{ strategy.max_drawdown }}%</td>
+                    <td>{{ strategy.walk_forward_window_count }}</td>
                     <td>{{ strategy.composite_score }}</td>
                   </tr>
                 {% else %}
-                  <tr><td colspan="7">Henuz strateji siralamasi yok.</td></tr>
+                  <tr><td colspan="8">Henuz strateji siralamasi yok.</td></tr>
                 {% endfor %}
               </tbody>
             </table>
@@ -78,8 +80,8 @@
         {% for item in top_backtest_symbols %}
           <li>
             <strong>{{ item.symbol }}</strong>
-            <span>{{ item.sector }} · {{ item.trade_count }} islem · {{ item.strategy_count }} strateji</span>
-            <span>{{ item.total_return_pct }}% getiri · {{ item.avg_r }}R ortalama · {{ item.win_rate }}% kazanma</span>
+            <span>{{ item.sector }} · {{ item.trade_count }} OOS islem · {{ item.strategy_count }} strateji · {{ item.walk_forward_window_count }} pencere</span>
+            <span>{{ item.total_return_pct }}% OOS getiri · {{ item.avg_r }}R ortalama · {{ item.win_rate }}% kazanma</span>
           </li>
         {% else %}
           <li><span>Henuz hisse bazli backtest verisi yok.</span></li>
@@ -153,13 +155,13 @@
         <button type="button" class="ghost-link button-reset" data-backtest-symbol-load>Backtest Yukle</button>
       </div>
       <p class="symbol-browser-status" data-backtest-symbol-status>
-        Hisse secerek o sembolun 2 yillik backtest grafigini acabilirsin.
+        Hisse secerek o sembolun walk-forward OOS trade grafigini acabilirsin.
       </p>
       <article class="chart-card chart-browser-card" data-dynamic-chart="true">
         <div class="chart-head">
           <div>
             <h3 data-backtest-chart-title>Secilen backtest hissesi</h3>
-            <p data-backtest-chart-subtitle>Tum stratejilerden gelen giris ve cikislar burada gosterilecek.</p>
+            <p data-backtest-chart-subtitle>Test pencerelerinden gelen OOS giris ve cikislar burada gosterilecek.</p>
           </div>
           <span class="pill" data-backtest-chart-meta>Hazir bekliyor</span>
         </div>
@@ -172,7 +174,7 @@
     <div class="panel-head">
       <div>
         <p class="eyebrow">Tarihsel Trade Isaretleri</p>
-        <h2>En basarili hisseler icin minimum 2 yillik 4 saatlik mum analizi</h2>
+        <h2>Walk-forward OOS trade haritasi</h2>
       </div>
       <span class="pill">{{ trade_charts | length }} grafik</span>
     </div>
@@ -184,7 +186,7 @@
               <h3>{{ chart.title }}</h3>
               <p>{{ chart.subtitle }}</p>
             </div>
-            <span class="pill">{{ chart.return_pct }}% · {{ chart.r_multiple }}R · {{ chart.data_source }}</span>
+            <span class="pill">{{ chart.return_pct }}% · {{ chart.r_multiple }}R · {{ chart.walk_forward_window_count }} pencere · {{ chart.data_source }}</span>
           </div>
           <div class="tv-chart" aria-label="{{ chart.title }}"></div>
           <script type="application/json" class="chart-payload">{{ chart | tojson }}</script>

@@ -83,6 +83,7 @@ def test_auto_paper_trading_opens_position_from_active_setup() -> None:
     assert position.status == PositionStatus.OPEN
     assert position.symbol == setup.symbol
     assert position.entry_reason
+    assert position.success_probability == setup.confidence
     assert store.setups[setup.id].status == SetupStatus.ENTERED
     assert store.setups[setup.id].thesis
 

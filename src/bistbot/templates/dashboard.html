@@ -104,6 +104,9 @@
             <div><dt>Uyum</dt><dd>{{ setup.confluence_score }}</dd></div>
             <div><dt>Beklenen R</dt><dd>{{ setup.expected_r }}</dd></div>
             <div><dt>Risk/Odul</dt><dd>{{ setup.risk_reward }}</dd></div>
+            <div><dt>WF Pencere</dt><dd>{{ setup.wf_window_count }}</dd></div>
+            <div><dt>WF Kazanma</dt><dd>{{ setup.wf_win_rate }}%</dd></div>
+            <div><dt>WF Getiri</dt><dd>{{ setup.wf_total_return_pct }}%</dd></div>
           </dl>
           <div class="range-block">
             <p>Giris Bolgesi</p>
@@ -153,6 +156,7 @@
               <th>Stop</th>
               <th>Hedef</th>
               <th>Adet</th>
+              <th>Basari Olasiligi</th>
               <th>Giris Gerekcesi</th>
             </tr>
           </thead>
@@ -165,10 +169,17 @@
                 <td>{{ position.stop_price }}</td>
                 <td>{{ position.target_price }}</td>
                 <td>{{ position.quantity }}</td>
+                <td>
+                  {% if position.success_probability_pct is not none %}
+                    {{ position.success_probability_pct }}%
+                  {% else %}
+                    -
+                  {% endif %}
+                </td>
                 <td class="reason-cell">{{ position.entry_reason }}</td>
               </tr>
             {% else %}
-              <tr><td colspan="7">Henuz acik pozisyon yok.</td></tr>
+              <tr><td colspan="8">Henuz acik pozisyon yok.</td></tr>
             {% endfor %}
           </tbody>
         </table>
