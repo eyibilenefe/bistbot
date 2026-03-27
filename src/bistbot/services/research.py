@@ -24,6 +24,8 @@ from bistbot.services.scoring import score_clusters
 from bistbot.services.setup_lifecycle import compute_confluence_score, quality_gate
 from bistbot.services.strategy_selection import select_active_strategies
 
+TREND_TRAILING_ATR_MULTIPLE = 2.5
+
 
 @dataclass(slots=True)
 class ResearchBuildResult:
@@ -398,7 +400,6 @@ def simulate_strategy(
 
     for index in range(60, len(bars)):
         bar = bars[index]
-        prev_bar = bars[index - 1]
         current_signal = strategy_signal(family=family, index=index, bars=bars, indicators=indicators)
 
         if position is None and current_signal:
@@ -414,6 +415,7 @@ def simulate_strategy(
                 "stop": entry_price - risk,
                 "risk": risk,
                 "bars_held": 0,
+                "highest_close": entry_price,
             }
             continue
 
@@ -424,6 +426,7 @@ def simulate_strategy(
         entry_price = float(position["entry_price"])
         risk = float(position["risk"])
         stop = float(position["stop"])
+        highest_close = max(float(position.get("highest_close", entry_price)), bar.close)
 
         if bar.low <= stop:
             exit_price = stop
@@ -441,11 +444,20 @@ def simulate_strategy(
             position = None
             continue
 
-        if bar.close >= entry_price + risk:
-            stop = max(stop, entry_price)
-        if bar.close >= entry_price + (2 * risk):
-            stop = max(stop, entry_price + risk)
+        if family == StrategyFamily.TREND_FOLLOWING:
+            if bar.close >= entry_price + risk:
+                stop = max(stop, entry_price)
+            atr_value = indicators.atr14[index]
+            if atr_value is not None and atr_value > 0:
+                stop = max(stop, highest_close - (atr_value * TREND_TRAILING_ATR_MULTIPLE))
+        else:
+            if bar.close >= entry_price + risk:
+                stop = max(stop, entry_price)
+            if bar.close >= entry_price + (2 * risk):
+                stop = max(stop, entry_price + risk)
+
         position["stop"] = stop
+        position["highest_close"] = highest_close
 
         should_exit = strategy_exit(
             family=family,
@@ -523,10 +535,7 @@ def strategy_exit(
     ema50 = indicators.ema50[index]
 
     if family == StrategyFamily.TREND_FOLLOWING:
-        trend_valid = ema20 is not None and ema50 is not None and close > ema20 and ema20 > ema50
-        if high >= entry_price + (2 * risk) and not trend_valid:
-            return True
-        return (bars_held >= 7 and not trend_valid) or (ema20 is not None and close < ema20)
+        return ema50 is not None and close < ema50
 
     if family == StrategyFamily.PULLBACK_MEAN_REVERSION:
         return (
@@ -730,7 +739,7 @@ def build_setup_candidates(
                     family=strategy.family,
                     bars=bars,
                     indicators=indicators,
-                    lookback_bars=3,
+                    lookback_bars=settings.setup_signal_lookback_bars,
                 )
                 if index is None:
                     continue
@@ -751,7 +760,10 @@ def build_setup_candidates(
                 )
                 entry_low = max(last_close - (atr_value * 0.25), 0.01)
                 entry_high = last_close + (atr_value * 0.25)
+                stop = max(last_close - (atr_value * 1.5), 0.01)
                 target = last_close + (atr_value * 3.0)
+                risk_per_share = max(entry_high - stop, 0.01)
+                expected_r = max((target - entry_high) / risk_per_share, 0.0)
                 confluence = compute_confluence_score(
                     daily_regime_valid=components["daily_regime_valid"],
                     trend_signal=components["trend_signal"],
@@ -770,17 +782,23 @@ def build_setup_candidates(
                         score=score,
                         entry_low=entry_low,
                         entry_high=entry_high,
-                        stop=max(last_close - (atr_value * 1.5), 0.01),
+                        stop=stop,
                         target=target,
                         confidence=min(0.99, 0.55 + (confluence * 0.35)),
                         confluence_score=confluence,
-                        expected_r=2.0,
+                        expected_r=expected_r,
                         created_at=now,
                         expires_at=now + timedelta(hours=settings.setup_expiration_hours),
                     )
                 )
 
-    return quality_gate(candidates, top_percent=settings.quality_gate_percentile)
+    return quality_gate(
+        candidates,
+        top_percent=settings.quality_gate_percentile,
+        min_keep=settings.quality_gate_min_keep,
+        min_expected_r=settings.setup_min_expected_r,
+        min_confluence_score=settings.setup_min_confluence_score,
+    )
 
 
 def ema(values: list[float], period: int) -> list[float | None]:

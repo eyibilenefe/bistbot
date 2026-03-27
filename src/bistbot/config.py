@@ -17,7 +17,11 @@ class Settings:
     max_total_portfolio_risk: float = 0.05
     min_cluster_size: int = 8
     setup_expiration_hours: int = 6
-    quality_gate_percentile: float = 0.10
+    quality_gate_percentile: float = 0.20
+    quality_gate_min_keep: int = 3
+    setup_signal_lookback_bars: int = 6
+    setup_min_expected_r: float = 1.5
+    setup_min_confluence_score: float = 0.65
     research_timeframe: str = "4h"
     backtest_lookback_days: int = 730
     backtest_min_daily_bars: int = 240

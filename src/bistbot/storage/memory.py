@@ -340,7 +340,13 @@ class InMemoryStore:
                 )
             )
 
-        active_setups = quality_gate(raw_setups, top_percent=self.settings.quality_gate_percentile)
+        active_setups = quality_gate(
+            raw_setups,
+            top_percent=self.settings.quality_gate_percentile,
+            min_keep=self.settings.quality_gate_min_keep,
+            min_expected_r=self.settings.setup_min_expected_r,
+            min_confluence_score=self.settings.setup_min_confluence_score,
+        )
         self.setups = {setup.id: self._enrich_setup(setup) for setup in active_setups}
 
         existing_position = PortfolioPosition(

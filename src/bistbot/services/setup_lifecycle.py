@@ -7,6 +7,9 @@ from datetime import datetime
 from bistbot.domain.enums import SetupStatus
 from bistbot.domain.models import SetupCandidate
 
+DEFAULT_MIN_EXPECTED_R = 1.5
+DEFAULT_MIN_CONFLUENCE_SCORE = 0.65
+
 
 def compute_confluence_score(
     *,
@@ -26,20 +29,29 @@ def compute_confluence_score(
     )
 
 
-def quality_gate(candidates: list[SetupCandidate], *, top_percent: float = 0.10) -> list[SetupCandidate]:
+def quality_gate(
+    candidates: list[SetupCandidate],
+    *,
+    top_percent: float = 0.10,
+    min_keep: int = 1,
+    min_expected_r: float = DEFAULT_MIN_EXPECTED_R,
+    min_confluence_score: float = DEFAULT_MIN_CONFLUENCE_SCORE,
+) -> list[SetupCandidate]:
     if not candidates:
         return []
 
     eligible = [
         candidate
         for candidate in candidates
-        if candidate.expected_r >= 2.0 and candidate.confluence_score >= 0.75
+        if candidate.expected_r >= min_expected_r
+        and candidate.confluence_score >= min_confluence_score
     ]
     if not eligible:
         return []
 
     eligible.sort(key=lambda candidate: candidate.score, reverse=True)
-    keep_count = max(1, math.ceil(len(candidates) * top_percent))
+    keep_count = max(int(min_keep), math.ceil(len(candidates) * top_percent))
+    keep_count = min(len(eligible), keep_count)
     return eligible[:keep_count]
 
 

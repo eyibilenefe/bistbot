@@ -45,6 +45,15 @@ def test_quality_gate_keeps_only_top_decile_candidates() -> None:
     assert [setup.id for setup in gated] == ["setup-0", "setup-1"]
 
 
+def test_quality_gate_can_keep_a_minimum_setup_floor() -> None:
+    candidates = [make_setup(index, score=1 - (index * 0.01)) for index in range(20)]
+
+    gated = quality_gate(candidates, top_percent=0.05, min_keep=3)
+
+    assert len(gated) == 3
+    assert [setup.id for setup in gated] == ["setup-0", "setup-1", "setup-2"]
+
+
 def test_setup_approval_and_manual_entry_validation() -> None:
     now = datetime.now(UTC)
     setup = approve_setup(make_setup(1, score=0.9), now=now)

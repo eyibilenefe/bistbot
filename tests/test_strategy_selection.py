@@ -65,7 +65,7 @@ def test_strategy_selection_keeps_family_diversity_and_correlation_limits() -> N
             StrategyFamily.TREND_FOLLOWING,
             9.99,
             [0.01, 0.03, 0.01, 0.02],
-            max_drawdown=0.25,
+            max_drawdown=0.31,
         ),
     ]
 

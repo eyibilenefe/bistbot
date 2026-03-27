@@ -152,7 +152,7 @@ def test_refresh_job_endpoints_return_progress_payload() -> None:
     assert "progress" in status_response.json()
 
 
-def test_over_20pct_maxdd_strategies_are_hidden_from_backtest_views() -> None:
+def test_over_30pct_maxdd_strategies_are_hidden_from_backtest_views() -> None:
     app = create_app(
         market_data_provider=FakeMarketDataProvider(),
         seed_demo_data=True,
@@ -174,7 +174,7 @@ def test_over_20pct_maxdd_strategies_are_hidden_from_backtest_views() -> None:
         total_return=0.90,
         win_rate=0.95,
         profit_factor=4.20,
-        max_drawdown=0.25,
+        max_drawdown=0.31,
         trade_count=200,
         avg_trade_return=0.03,
         estimated_round_trip_cost=0.002,

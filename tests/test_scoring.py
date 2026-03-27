@@ -33,16 +33,25 @@ def make_score(*, max_drawdown: float) -> StrategyScore:
     return score
 
 
-def test_composite_score_penalizes_drawdown_more_aggressively() -> None:
+def test_composite_score_rebalances_drawdown_penalty_without_flattening_alpha() -> None:
     score = make_score(max_drawdown=0.12)
 
     composite = compute_composite_score(score)
 
-    assert composite == pytest.approx(0.6)
+    assert composite == pytest.approx(0.72)
 
 
-def test_composite_score_marks_over_20pct_drawdown_as_garbage() -> None:
+def test_composite_score_applies_soft_penalty_in_mid_drawdown_band() -> None:
     score = make_score(max_drawdown=0.25)
+
+    composite = compute_composite_score(score)
+
+    assert composite == pytest.approx(0.42)
+    assert not math.isinf(composite)
+
+
+def test_composite_score_marks_over_30pct_drawdown_as_garbage() -> None:
+    score = make_score(max_drawdown=0.31)
 
     composite = compute_composite_score(score)
 
