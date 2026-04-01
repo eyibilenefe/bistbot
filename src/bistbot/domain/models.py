@@ -8,6 +8,7 @@ from bistbot.domain.enums import (
     ClusterFallbackMode,
     CorporateActionType,
     DataQualityEventType,
+    LifecycleEventType,
     PositionStatus,
     SetupStatus,
     StrategyFamily,
@@ -73,6 +74,8 @@ class StrategyScore:
     estimated_round_trip_cost: float
     oos_window_trade_counts: list[int] = field(default_factory=list)
     oos_returns: list[float] = field(default_factory=list)
+    walk_forward_window_count: int = 0
+    backtest_mode: str = "walk_forward"
     normalized_return: float = 0.0
     normalized_win_rate: float = 0.0
     normalized_profit_factor: float = 0.0
@@ -97,6 +100,9 @@ class SetupCandidate:
     expected_r: float
     created_at: datetime
     expires_at: datetime
+    wf_window_count: int = 0
+    wf_win_rate: float = 0.0
+    wf_total_return_pct: float = 0.0
     thesis: str = ""
     status: SetupStatus = SetupStatus.ACTIVE
     invalidated_reason: str | None = None
@@ -115,12 +121,18 @@ class PortfolioPosition:
     last_price: float
     opened_at: datetime
     entry_reason: str = ""
+    success_probability: float | None = None
     closed_at: datetime | None = None
     adjustment_factor: float = 1.0
     adjusted_entry_price: float | None = None
     adjusted_stop_price: float | None = None
     adjusted_target_price: float | None = None
     last_corporate_action_at: datetime | None = None
+    source_setup_id: str | None = None
+    initial_stop_price: float | None = None
+    initial_target_price: float | None = None
+    expected_r_at_entry: float | None = None
+    confidence_at_entry: float | None = None
 
 
 @dataclass(slots=True)
@@ -171,6 +183,17 @@ class JobRun:
     started_at: datetime
     completed_at: datetime
     status: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class LifecycleEvent:
+    id: str
+    event_type: LifecycleEventType
+    occurred_at: datetime
+    symbol: str | None = None
+    setup_id: str | None = None
+    position_id: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
 

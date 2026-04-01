@@ -132,3 +132,23 @@ def test_trend_exit_allows_shallow_pullbacks_but_exits_on_deeper_breakdown() -> 
         entry_price=bars[80].close,
         risk=5.0,
     )
+
+
+def test_walk_forward_simulation_forces_close_at_window_end() -> None:
+    bars = build_trend_runner_bars()
+    indicators = compute_indicators(bars)
+
+    trades = simulate_strategy(
+        strategy_id="cluster:trend",
+        symbol="TUPRS",
+        family=StrategyFamily.TREND_FOLLOWING,
+        bars=bars,
+        indicators=indicators,
+        entry_start=(bars[60].timestamp.date()),
+        trade_end=(bars[118].timestamp.date()),
+    )
+
+    assert len(trades) >= 1
+    assert all(trade.entered_at.date() >= bars[60].timestamp.date() for trade in trades)
+    assert all(trade.exited_at.date() <= bars[118].timestamp.date() for trade in trades)
+    assert trades[-1].exited_at.date() == bars[118].timestamp.date()

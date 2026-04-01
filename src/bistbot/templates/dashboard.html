@@ -49,6 +49,9 @@
         <h2>Gercek piyasa ozeti</h2>
       </div>
     </div>
+    {% if market_watchlist_hidden_count %}
+      <p class="panel-copy">{{ market_watchlist_hidden_count }} satir gecersiz veri nedeniyle gizlendi.</p>
+    {% endif %}
     <div class="table-wrap">
       <table>
         <thead>
@@ -104,6 +107,9 @@
             <div><dt>Uyum</dt><dd>{{ setup.confluence_score }}</dd></div>
             <div><dt>Beklenen R</dt><dd>{{ setup.expected_r }}</dd></div>
             <div><dt>Risk/Odul</dt><dd>{{ setup.risk_reward }}</dd></div>
+            <div><dt>WF Pencere</dt><dd>{{ setup.wf_window_count }}</dd></div>
+            <div><dt>WF Kazanma</dt><dd>{{ setup.wf_win_rate }}%</dd></div>
+            <div><dt>WF Getiri</dt><dd>{{ setup.wf_total_return_pct }}%</dd></div>
           </dl>
           <div class="range-block">
             <p>Giris Bolgesi</p>
@@ -143,6 +149,9 @@
         </div>
         <a class="ghost-link" href="/api/positions">Ham JSON</a>
       </div>
+      {% if positions_hidden_count %}
+        <p class="panel-copy">{{ positions_hidden_count }} pozisyon gecersiz veri nedeniyle tabloda gizlendi.</p>
+      {% endif %}
       <div class="table-wrap">
         <table>
           <thead>
@@ -153,6 +162,7 @@
               <th>Stop</th>
               <th>Hedef</th>
               <th>Adet</th>
+              <th>Basari Olasiligi</th>
               <th>Giris Gerekcesi</th>
             </tr>
           </thead>
@@ -165,10 +175,17 @@
                 <td>{{ position.stop_price }}</td>
                 <td>{{ position.target_price }}</td>
                 <td>{{ position.quantity }}</td>
+                <td>
+                  {% if position.success_probability_pct is not none %}
+                    {{ position.success_probability_pct }}%
+                  {% else %}
+                    -
+                  {% endif %}
+                </td>
                 <td class="reason-cell">{{ position.entry_reason }}</td>
               </tr>
             {% else %}
-              <tr><td colspan="7">Henuz acik pozisyon yok.</td></tr>
+              <tr><td colspan="8">Henuz acik pozisyon yok.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -211,6 +228,132 @@
         </div>
       </div>
     </section>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Lifecycle Kaydi</p>
+        <h2>Son olaylar</h2>
+      </div>
+      <a class="ghost-link" href="/api/events/lifecycle">Ham JSON</a>
+    </div>
+    <ul class="insight-list">
+      {% for event in recent_lifecycle_events %}
+        <li>
+          <strong>{{ event.message }}</strong>
+          <span>{{ event.occurred_at }}</span>
+        </li>
+      {% else %}
+        <li><span>Henuz lifecycle olayi kaydi yok.</span></li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Paper Trade Arsivi</p>
+        <h2>Gecmis islemler</h2>
+      </div>
+      <a class="ghost-link" href="/api/paper-trades/history">Ham JSON</a>
+    </div>
+    {% if paper_trade_history_hidden_count %}
+      <p class="panel-copy">{{ paper_trade_history_hidden_count }} kapanan islem gecersiz veri nedeniyle gizlendi.</p>
+    {% endif %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Hisse</th>
+            <th>Giris</th>
+            <th>Cikis</th>
+            <th>Adet</th>
+            <th>Getiri</th>
+            <th>PnL</th>
+            <th>Sure</th>
+            <th>Kapanis Nedeni</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for position in paper_trade_history %}
+            <tr>
+              <td>{{ position.symbol }}</td>
+              <td>{{ position.entry_price }}</td>
+              <td>{{ position.exit_price }}</td>
+              <td>{{ position.quantity }}</td>
+              <td>
+                {% if position.realized_return_pct is not none %}
+                  {{ position.realized_return_pct }}%
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>
+                {% if position.realized_pnl is not none %}
+                  {{ position.realized_pnl }} TRY
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>
+                {% if position.holding_days is not none %}
+                  {{ position.holding_days }} gun
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>{{ position.close_reason or "-" }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="8">Henuz kapanan paper trade islemi yok.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Paper Trade Haritasi</p>
+        <h2>Sembol secerek paper trade grafigi ac</h2>
+      </div>
+      <span class="pill">{{ available_paper_trade_symbols | length }} sembol</span>
+    </div>
+    <div class="symbol-browser" data-paper-trade-browser>
+      <label class="field-label" for="paper-trade-symbol-input">Paper Trade Hissesi</label>
+      <div class="symbol-browser-controls">
+        <input
+          id="paper-trade-symbol-input"
+          class="symbol-input"
+          type="text"
+          list="paper-trade-symbol-options"
+          value="{{ featured_paper_trade_symbol or '' }}"
+          placeholder="Orn. KCHOL"
+          data-paper-trade-symbol-input
+        >
+        <datalist id="paper-trade-symbol-options">
+          {% for symbol in available_paper_trade_symbols %}
+            <option value="{{ symbol }}"></option>
+          {% endfor %}
+        </datalist>
+        <button type="button" class="ghost-link button-reset" data-paper-trade-symbol-load>Paper Trade Yukle</button>
+      </div>
+      <p class="symbol-browser-status" data-paper-trade-symbol-status>
+        Acik ve kapanan paper trade giris/cikis izleri burada gosterilir.
+      </p>
+      <article class="chart-card chart-browser-card" data-dynamic-chart="true">
+        <div class="chart-head">
+          <div>
+            <h3 data-paper-trade-chart-title>Secilen paper trade hissesi</h3>
+            <p data-paper-trade-chart-subtitle>Paper trade girisleri, cikislari ve acik pozisyon seviyeleri burada gosterilecek.</p>
+          </div>
+          <span class="pill" data-paper-trade-chart-meta>Hazir bekliyor</span>
+        </div>
+        <div class="tv-chart" aria-label="Paper trade grafigi" data-paper-trade-chart-container></div>
+      </article>
+    </div>
   </section>
 
   <section class="panel">

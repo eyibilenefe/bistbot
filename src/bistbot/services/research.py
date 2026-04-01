@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from statistics import fmean
@@ -18,7 +19,8 @@ from bistbot.domain.models import (
     TradeRecord,
 )
 from bistbot.providers.base import MarketDataProvider
-from bistbot.services.clustering import assign_point_in_time_clusters
+from bistbot.services.backtest import generate_walk_forward_windows
+from bistbot.services.clustering import assign_point_in_time_clusters, freeze_cluster_assignments_for_test_window
 from bistbot.services.costs import CostInputs, estimated_round_trip_cost
 from bistbot.services.scoring import score_clusters
 from bistbot.services.setup_lifecycle import compute_confluence_score, quality_gate
@@ -109,7 +111,7 @@ def build_real_research_state(
         )
 
     _emit_progress(progress_callback, 65, "Point-in-time kumeleme hesaplaniyor...")
-    clusters_list, assignments = assign_point_in_time_clusters(
+    clusters_list, _ = assign_point_in_time_clusters(
         snapshots,
         as_of=end.date(),
         min_cluster_size=settings.min_cluster_size,
@@ -117,72 +119,139 @@ def build_real_research_state(
     clusters = {cluster.id: cluster for cluster in clusters_list}
 
     strategy_templates = _strategy_templates()
-    strategies: dict[str, StrategyDefinition] = {}
-    strategy_scores_raw: list[StrategyScore] = []
-    trades_by_strategy: dict[str, list[TradeRecord]] = {}
-    total_strategy_runs = max(len(clusters_list) * len(strategy_templates), 1)
-    strategy_run_index = 0
+    strategies = _build_strategy_definitions(clusters_list, strategy_templates)
+    windows = generate_walk_forward_windows(
+        end_date=end.date(),
+        lookback_days=lookback_days,
+        train_days=settings.walk_forward_train_days,
+        test_days=settings.walk_forward_test_days,
+        step_days=settings.walk_forward_step_days,
+    )
+    total_window_runs = max(len(windows), 1)
+    oos_trades_by_strategy: dict[str, list[TradeRecord]] = defaultdict(list)
+    oos_costs_by_strategy: dict[str, list[float]] = defaultdict(list)
+    oos_metrics_by_window: list[dict[str, tuple[int, float, float]]] = []
 
-    for cluster in clusters_list:
-        cluster_symbols = [symbol for symbol in cluster.members if symbol in bars_by_symbol]
-        cluster_atr_now = fmean(
-            indicators_by_symbol[symbol].atr14_pct[-1] or 0.0 for symbol in cluster_symbols
-        ) if cluster_symbols else 0.0
-        cluster_atr_baseline = fmean(
-            indicators_by_symbol[symbol].atr60_pct[-1] or 0.0 for symbol in cluster_symbols
-        ) if cluster_symbols else 0.0
+    for window_index, window in enumerate(windows, start=1):
+        _emit_progress(
+            progress_callback,
+            70 + int((window_index / total_window_runs) * 22),
+            (
+                "Walk-forward backtest calisiyor: "
+                f"{window_index}/{total_window_runs} "
+                f"(train {window.train_start.isoformat()}..{window.train_end.isoformat()}, "
+                f"test {window.test_start.isoformat()}..{window.test_end.isoformat()})"
+            ),
+        )
 
-        for template in strategy_templates:
-            strategy_run_index += 1
-            _emit_progress(
-                progress_callback,
-                70 + int((strategy_run_index / total_strategy_runs) * 25),
-                f"Backtest calisiyor: {cluster.id} / {template.name_tr}",
+        window_snapshots = _build_point_in_time_snapshots(
+            bars_by_symbol=bars_by_symbol,
+            indicators_by_symbol=indicators_by_symbol,
+            symbol_sectors=symbol_sectors,
+            as_of=window.train_end,
+        )
+        window_clusters_list, _ = freeze_cluster_assignments_for_test_window(
+            window_snapshots,
+            window_start=window.train_end,
+            min_cluster_size=settings.min_cluster_size,
+        )
+        window_metrics: dict[str, tuple[int, float, float]] = {}
+
+        for cluster in window_clusters_list:
+            cluster_symbols = [symbol for symbol in cluster.members if symbol in bars_by_symbol]
+            if not cluster_symbols:
+                continue
+            cost = _estimate_cluster_cost_as_of(
+                cluster_symbols=cluster_symbols,
+                bars_by_symbol=bars_by_symbol,
+                indicators_by_symbol=indicators_by_symbol,
+                as_of=window.train_end,
             )
-            strategy_id = f"{cluster.id}:{template.family.value}"
-            strategies[strategy_id] = StrategyDefinition(
-                id=strategy_id,
-                name=f"{cluster.sector.title()} {template.name_tr}",
-                family=template.family,
-                trend_indicator=template.trend_indicator,
-                momentum_indicator=template.momentum_indicator,
-                volume_indicator=template.volume_indicator,
-            )
+            train_scores: list[StrategyScore] = []
 
-            cluster_trades: list[TradeRecord] = []
-            for symbol in cluster_symbols:
-                cluster_trades.extend(
-                    simulate_strategy(
+            for template in strategy_templates:
+                strategy_id = f"{cluster.id}:{template.family.value}"
+                train_trades: list[TradeRecord] = []
+                for symbol in cluster_symbols:
+                    train_trades.extend(
+                        simulate_strategy(
+                            strategy_id=strategy_id,
+                            symbol=symbol,
+                            family=template.family,
+                            bars=bars_by_symbol[symbol],
+                            indicators=indicators_by_symbol[symbol],
+                            entry_start=window.train_start,
+                            trade_end=window.train_end,
+                        )
+                    )
+                train_scores.append(
+                    summarize_strategy(
                         strategy_id=strategy_id,
-                        symbol=symbol,
+                        cluster_id=cluster.id,
                         family=template.family,
-                        bars=bars_by_symbol[symbol],
-                        indicators=indicators_by_symbol[symbol],
+                        as_of=window.train_end,
+                        trades=sorted(train_trades, key=lambda trade: trade.entered_at),
+                        estimated_cost=cost,
+                        window_end=_window_recent_end(window.train_end),
                     )
                 )
 
-            cost = estimated_round_trip_cost(
-                CostInputs(
-                    broker_fee=0.0015,
-                    taxes=0.0005,
-                    base_slippage=0.0010,
-                    atr20_current=cluster_atr_now,
-                    atr20_60d_median=cluster_atr_baseline,
+            selected_scores = select_active_strategies(train_scores)
+            for selected_score in selected_scores:
+                test_trades: list[TradeRecord] = []
+                for symbol in cluster_symbols:
+                    test_trades.extend(
+                        simulate_strategy(
+                            strategy_id=selected_score.strategy_id,
+                            symbol=symbol,
+                            family=selected_score.family,
+                            bars=bars_by_symbol[symbol],
+                            indicators=indicators_by_symbol[symbol],
+                            entry_start=window.test_start,
+                            trade_end=window.test_end,
+                        )
+                    )
+                ordered_test_trades = sorted(test_trades, key=lambda trade: trade.entered_at)
+                oos_trades_by_strategy[selected_score.strategy_id].extend(ordered_test_trades)
+                oos_costs_by_strategy[selected_score.strategy_id].append(cost)
+                window_metrics[selected_score.strategy_id] = (
+                    len(ordered_test_trades),
+                    _aggregate_window_return(ordered_test_trades),
+                    cost,
                 )
-            )
-            trades_by_strategy[strategy_id] = sorted(cluster_trades, key=lambda trade: trade.entered_at)
+        oos_metrics_by_window.append(window_metrics)
+
+    _emit_progress(progress_callback, 93, "Walk-forward OOS skorlar hesaplaniyor...")
+    strategy_scores_raw: list[StrategyScore] = []
+    for cluster in clusters_list:
+        cluster_symbols = [symbol for symbol in cluster.members if symbol in bars_by_symbol]
+        default_cost = _estimate_cluster_cost_as_of(
+            cluster_symbols=cluster_symbols,
+            bars_by_symbol=bars_by_symbol,
+            indicators_by_symbol=indicators_by_symbol,
+            as_of=end.date(),
+        )
+        for template in strategy_templates:
+            strategy_id = f"{cluster.id}:{template.family.value}"
+            strategy_trades = sorted(oos_trades_by_strategy.get(strategy_id, []), key=lambda trade: trade.entered_at)
+            window_counts = [metrics.get(strategy_id, (0, 0.0, default_cost))[0] for metrics in oos_metrics_by_window]
+            window_returns = [metrics.get(strategy_id, (0, 0.0, default_cost))[1] for metrics in oos_metrics_by_window]
+            strategy_costs = oos_costs_by_strategy.get(strategy_id, [])
             strategy_scores_raw.append(
                 summarize_strategy(
                     strategy_id=strategy_id,
                     cluster_id=cluster.id,
                     family=template.family,
                     as_of=end.date(),
-                    trades=trades_by_strategy[strategy_id],
-                    estimated_cost=cost,
+                    trades=strategy_trades,
+                    estimated_cost=fmean(strategy_costs) if strategy_costs else default_cost,
+                    window_counts=window_counts,
+                    window_returns=window_returns,
+                    walk_forward_window_count=len(oos_metrics_by_window),
                 )
             )
 
-    _emit_progress(progress_callback, 97, "Aktif stratejiler seciliyor...")
+    _emit_progress(progress_callback, 97, "Aktif OOS stratejiler seciliyor...")
     scored = score_clusters(strategy_scores_raw)
     strategy_scores = {score.strategy_id: score for score in scored}
 
@@ -211,9 +280,108 @@ def build_real_research_state(
         strategies=strategies,
         strategy_scores=strategy_scores,
         cluster_active_strategy_ids=cluster_active_strategy_ids,
-        backtest_trades=trades_by_strategy,
+        backtest_trades={key: sorted(value, key=lambda trade: trade.entered_at) for key, value in oos_trades_by_strategy.items()},
         setups=setups,
     )
+
+
+def _build_strategy_definitions(
+    clusters_list: list[ClusterDefinition],
+    strategy_templates: list["StrategyTemplate"],
+) -> dict[str, StrategyDefinition]:
+    strategies: dict[str, StrategyDefinition] = {}
+    for cluster in clusters_list:
+        for template in strategy_templates:
+            strategy_id = f"{cluster.id}:{template.family.value}"
+            strategies[strategy_id] = StrategyDefinition(
+                id=strategy_id,
+                name=f"{cluster.sector.title()} {template.name_tr}",
+                family=template.family,
+                trend_indicator=template.trend_indicator,
+                momentum_indicator=template.momentum_indicator,
+                volume_indicator=template.volume_indicator,
+            )
+    return strategies
+
+
+def _build_point_in_time_snapshots(
+    *,
+    bars_by_symbol: dict[str, list[PriceBar]],
+    indicators_by_symbol: dict[str, SymbolIndicators],
+    symbol_sectors: dict[str, str],
+    as_of: date,
+) -> list[SymbolSnapshot]:
+    snapshots: list[SymbolSnapshot] = []
+    for symbol, bars in bars_by_symbol.items():
+        indicators = indicators_by_symbol.get(symbol)
+        if indicators is None:
+            continue
+        index = _last_bar_index_on_or_before(bars, as_of)
+        if index is None:
+            continue
+        atr_pct = indicators.atr60_pct[index]
+        if atr_pct is None:
+            continue
+        snapshots.append(
+            SymbolSnapshot(
+                symbol=symbol,
+                sector=symbol_sectors.get(symbol, "unknown"),
+                atr_percent_60d=atr_pct,
+                as_of=as_of,
+            )
+        )
+    return snapshots
+
+
+def _last_bar_index_on_or_before(bars: list[PriceBar], as_of: date) -> int | None:
+    last_index: int | None = None
+    for index, bar in enumerate(bars):
+        if bar.timestamp.date() > as_of:
+            break
+        last_index = index
+    return last_index
+
+
+def _estimate_cluster_cost_as_of(
+    *,
+    cluster_symbols: list[str],
+    bars_by_symbol: dict[str, list[PriceBar]],
+    indicators_by_symbol: dict[str, SymbolIndicators],
+    as_of: date,
+) -> float:
+    atr14_values: list[float] = []
+    atr60_values: list[float] = []
+    for symbol in cluster_symbols:
+        bars = bars_by_symbol.get(symbol, [])
+        indicators = indicators_by_symbol.get(symbol)
+        if not bars or indicators is None:
+            continue
+        index = _last_bar_index_on_or_before(bars, as_of)
+        if index is None:
+            continue
+        atr14_pct = indicators.atr14_pct[index]
+        atr60_pct = indicators.atr60_pct[index]
+        if atr14_pct is not None:
+            atr14_values.append(atr14_pct)
+        if atr60_pct is not None:
+            atr60_values.append(atr60_pct)
+    return estimated_round_trip_cost(
+        CostInputs(
+            broker_fee=0.0015,
+            taxes=0.0005,
+            base_slippage=0.0010,
+            atr20_current=fmean(atr14_values) if atr14_values else 0.0,
+            atr20_60d_median=fmean(atr60_values) if atr60_values else 0.0,
+        )
+    )
+
+
+def _aggregate_window_return(trades: list[TradeRecord]) -> float:
+    return sum(trade.return_pct for trade in trades)
+
+
+def _window_recent_end(as_of: date) -> datetime:
+    return datetime.combine(as_of + timedelta(days=1), datetime.min.time(), tzinfo=UTC)
 
 
 def _emit_progress(
@@ -394,11 +562,35 @@ def simulate_strategy(
     family: StrategyFamily,
     bars: list[PriceBar],
     indicators: SymbolIndicators,
+    entry_start: date | None = None,
+    trade_end: date | None = None,
 ) -> list[TradeRecord]:
     trades: list[TradeRecord] = []
     position: dict[str, object] | None = None
+    if len(bars) < 61:
+        return trades
 
-    for index in range(60, len(bars)):
+    start_index = 60
+    if entry_start is not None:
+        matching_indices = [
+            index
+            for index, bar in enumerate(bars)
+            if index >= 60 and bar.timestamp.date() >= entry_start
+        ]
+        if not matching_indices:
+            return trades
+        start_index = matching_indices[0]
+
+    end_index = len(bars) - 1
+    if trade_end is not None:
+        eligible_indices = [index for index, bar in enumerate(bars) if bar.timestamp.date() <= trade_end]
+        if not eligible_indices:
+            return trades
+        end_index = eligible_indices[-1]
+    if start_index > end_index:
+        return trades
+
+    for index in range(start_index, end_index + 1):
         bar = bars[index]
         current_signal = strategy_signal(family=family, index=index, bars=bars, indicators=indicators)
 
@@ -481,6 +673,20 @@ def simulate_strategy(
                 )
             )
             position = None
+
+    if position is not None:
+        last_bar = bars[end_index]
+        trades.append(
+            build_trade_record(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                entry_time=position["entry_time"],
+                exit_time=last_bar.timestamp,
+                entry_price=float(position["entry_price"]),
+                exit_price=last_bar.close,
+                risk=float(position["risk"]),
+            )
+        )
 
     return trades
 
@@ -591,7 +797,12 @@ def summarize_strategy(
     as_of: date,
     trades: list[TradeRecord],
     estimated_cost: float,
+    window_counts: list[int] | None = None,
+    window_returns: list[float] | None = None,
+    walk_forward_window_count: int | None = None,
+    window_end: datetime | None = None,
 ) -> StrategyScore:
+    resolved_window_counts, resolved_window_returns = _normalize_window_metrics(window_counts, window_returns)
     if not trades:
         return StrategyScore(
             strategy_id=strategy_id,
@@ -605,8 +816,13 @@ def summarize_strategy(
             trade_count=0,
             avg_trade_return=0.0,
             estimated_round_trip_cost=estimated_cost,
-            oos_window_trade_counts=[0, 0, 0, 0, 0, 0],
-            oos_returns=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            oos_window_trade_counts=resolved_window_counts,
+            oos_returns=resolved_window_returns,
+            walk_forward_window_count=(
+                walk_forward_window_count
+                if walk_forward_window_count is not None
+                else len(resolved_window_counts)
+            ),
         )
 
     returns = [trade.return_pct for trade in trades]
@@ -616,24 +832,30 @@ def summarize_strategy(
     profit_factor = (sum(wins) / sum(losses)) if losses else float(len(wins) or 0)
     avg_trade_return = fmean(returns)
 
-    per_symbol = [
-        summarize_symbol_trade_history(symbol_trades)
-        for symbol_trades in _group_trades_by_symbol(trades).values()
-        if symbol_trades
-    ]
+    per_symbol = []
+    for symbol_trades in _group_trades_by_symbol(trades).values():
+        if not symbol_trades:
+            continue
+        per_symbol.append(
+            summarize_symbol_trade_history(
+                symbol_trades,
+                recent_end=window_end,
+            )
+        )
     total_return = fmean(summary.total_return for summary in per_symbol) if per_symbol else 0.0
     max_drawdown = percentile(
         [summary.max_drawdown for summary in per_symbol],
         0.75,
     ) if per_symbol else 1.0
-    window_counts = [
-        sum(summary.window_counts[index] for summary in per_symbol)
-        for index in range(6)
-    ] if per_symbol else [0, 0, 0, 0, 0, 0]
-    window_returns = [
-        fmean(summary.window_returns[index] for summary in per_symbol)
-        for index in range(6)
-    ] if per_symbol else [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    if window_counts is None and window_returns is None:
+        resolved_window_counts = [
+            sum(summary.window_counts[index] for summary in per_symbol)
+            for index in range(6)
+        ] if per_symbol else [0, 0, 0, 0, 0, 0]
+        resolved_window_returns = [
+            fmean(summary.window_returns[index] for summary in per_symbol)
+            for index in range(6)
+        ] if per_symbol else [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     return StrategyScore(
         strategy_id=strategy_id,
@@ -647,8 +869,13 @@ def summarize_strategy(
         trade_count=len(trades),
         avg_trade_return=avg_trade_return,
         estimated_round_trip_cost=estimated_cost,
-        oos_window_trade_counts=window_counts,
-        oos_returns=window_returns,
+        oos_window_trade_counts=resolved_window_counts,
+        oos_returns=resolved_window_returns,
+        walk_forward_window_count=(
+            walk_forward_window_count
+            if walk_forward_window_count is not None
+            else len(resolved_window_counts)
+        ),
     )
 
 
@@ -661,7 +888,11 @@ def _group_trades_by_symbol(trades: list[TradeRecord]) -> dict[str, list[TradeRe
     return grouped
 
 
-def summarize_symbol_trade_history(trades: list[TradeRecord]) -> SymbolTradeSummary:
+def summarize_symbol_trade_history(
+    trades: list[TradeRecord],
+    *,
+    recent_end: datetime | None = None,
+) -> SymbolTradeSummary:
     sorted_trades = sorted(trades, key=lambda trade: trade.exited_at)
     equity = 1.0
     peak = 1.0
@@ -672,7 +903,7 @@ def summarize_symbol_trade_history(trades: list[TradeRecord]) -> SymbolTradeSumm
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - equity) / peak)
 
-    recent_end = datetime.now(UTC)
+    recent_end = recent_end or datetime.now(UTC)
     window_counts: list[int] = []
     window_returns: list[float] = []
     for window_index in range(5, -1, -1):
@@ -690,6 +921,25 @@ def summarize_symbol_trade_history(trades: list[TradeRecord]) -> SymbolTradeSumm
         window_counts=window_counts,
         window_returns=window_returns,
     )
+
+
+def _normalize_window_metrics(
+    window_counts: list[int] | None,
+    window_returns: list[float] | None,
+) -> tuple[list[int], list[float]]:
+    if window_counts is None and window_returns is None:
+        return [0, 0, 0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    normalized_counts = list(window_counts or [])
+    normalized_returns = list(window_returns or [])
+    target_length = max(len(normalized_counts), len(normalized_returns))
+    if target_length == 0:
+        return [], []
+    if len(normalized_counts) < target_length:
+        normalized_counts.extend([0] * (target_length - len(normalized_counts)))
+    if len(normalized_returns) < target_length:
+        normalized_returns.extend([0.0] * (target_length - len(normalized_returns)))
+    return normalized_counts, normalized_returns
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -789,6 +1039,9 @@ def build_setup_candidates(
                         expected_r=expected_r,
                         created_at=now,
                         expires_at=now + timedelta(hours=settings.setup_expiration_hours),
+                        wf_window_count=strategy_score.walk_forward_window_count,
+                        wf_win_rate=round(strategy_score.win_rate * 100, 2),
+                        wf_total_return_pct=round(strategy_score.total_return * 100, 2),
                     )
                 )
 

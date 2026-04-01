@@ -36,6 +36,17 @@ class PositionStatus(StrEnum):
     CLOSED = "closed"
 
 
+class LifecycleEventType(StrEnum):
+    SETUP_CREATED = "setup_created"
+    SETUP_INVALIDATED = "setup_invalidated"
+    SETUP_EXPIRED = "setup_expired"
+    SETUP_APPROVED = "setup_approved"
+    POSITION_ENTERED = "position_entered"
+    STOP_MOVED_TO_BREAKEVEN = "stop_moved_to_breakeven"
+    STOP_MOVED_TO_PLUS_1R = "stop_moved_to_plus_1r"
+    POSITION_CLOSED = "position_closed"
+
+
 class DataQualityEventType(StrEnum):
     UNEXPLAINED_GAP = "unexplained_gap"
     STALE_DATA = "stale_data"

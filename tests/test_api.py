@@ -80,6 +80,7 @@ def test_dashboard_and_manual_entry_flow() -> None:
     assert setups_response.status_code == 200
     top_setups = setups_response.json()
     assert len(top_setups) >= 1
+    assert top_setups[0]["wf_window_count"] >= 1
 
     setup_id = top_setups[0]["id"]
     approve_response = client.post(f"/api/setups/{setup_id}/approve")
@@ -92,10 +93,20 @@ def test_dashboard_and_manual_entry_flow() -> None:
     )
     assert entry_response.status_code == 200
     assert entry_response.json()["symbol"] == top_setups[0]["symbol"]
+    assert entry_response.json()["success_probability"] == top_setups[0]["confidence"]
+    position_id = entry_response.json()["id"]
+
+    close_response = client.patch(
+        f"/api/positions/{position_id}",
+        json={"last_price": 22.4, "status": "closed"},
+    )
+    assert close_response.status_code == 200
+    assert close_response.json()["status"] == "closed"
 
     clusters_response = client.get("/api/backtests/clusters")
     assert clusters_response.status_code == 200
     assert len(clusters_response.json()) >= 1
+    assert clusters_response.json()[0]["backtest_mode"] == "walk_forward"
 
     market_chart_response = client.get("/api/market/charts/AKBNK")
     assert market_chart_response.status_code == 200
@@ -104,10 +115,21 @@ def test_dashboard_and_manual_entry_flow() -> None:
     backtest_symbols_response = client.get("/api/backtests/symbols")
     assert backtest_symbols_response.status_code == 200
     assert len(backtest_symbols_response.json()) >= 1
+    assert backtest_symbols_response.json()[0]["backtest_mode"] == "walk_forward"
 
     backtest_symbol_chart_response = client.get("/api/backtests/symbols/AKBNK")
     assert backtest_symbol_chart_response.status_code == 200
     assert len(backtest_symbol_chart_response.json()["candles"]) >= 1
+    assert backtest_symbol_chart_response.json()["backtest_mode"] == "walk_forward"
+
+    paper_trade_history_response = client.get("/api/paper-trades/history")
+    assert paper_trade_history_response.status_code == 200
+    assert any(item["id"] == position_id for item in paper_trade_history_response.json())
+
+    paper_trade_chart_response = client.get(f"/api/paper-trades/symbols/{top_setups[0]['symbol']}")
+    assert paper_trade_chart_response.status_code == 200
+    assert len(paper_trade_chart_response.json()["candles"]) >= 1
+    assert paper_trade_chart_response.json()["paper_trade_count"] >= 1
 
 
 def test_html_dashboard_and_backtest_pages_render() -> None:
@@ -121,15 +143,21 @@ def test_html_dashboard_and_backtest_pages_render() -> None:
     assert "Tum Hisseler" in dashboard_response.text
     assert "Grafik Yukle" in dashboard_response.text
     assert "Giris" in dashboard_response.text
+    assert "Basari Olasiligi" in dashboard_response.text
+    assert "WF Pencere" in dashboard_response.text
     assert "Yahoo Finance (.IS)" in dashboard_response.text
     assert "Neden Secildi" in dashboard_response.text
     assert "Giris Gerekcesi" in dashboard_response.text
+    assert "Gecmis islemler" in dashboard_response.text
+    assert "Paper Trade Haritasi" in dashboard_response.text
+    assert "Paper Trade Yukle" in dashboard_response.text
 
     backtest_response = client.get("/backtest")
     assert backtest_response.status_code == 200
     assert "Gercek veri kume siralamasi" in backtest_response.text
     assert "En Basarili Hisseler" in backtest_response.text
     assert "Istedigin hissenin backtestini ac" in backtest_response.text
+    assert "Walk-forward OOS" in backtest_response.text
     assert "Tarihsel Trade Isaretleri" in backtest_response.text
     assert (
         "Cikis" in backtest_response.text

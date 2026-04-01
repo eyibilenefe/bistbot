@@ -8,7 +8,6 @@ from fastapi.staticfiles import StaticFiles
 from bistbot.api.routes import register_routes
 from bistbot.config import get_settings
 from bistbot.providers.base import MarketDataProvider
-from bistbot.providers.yahoo import YahooFinanceBISTProvider
 from bistbot.services.jobs import JobService
 from bistbot.storage.memory import InMemoryStore
 from bistbot.web.routes import register_web_routes
@@ -28,6 +27,8 @@ def create_app(
     app.state.settings = settings
     provider = market_data_provider
     if provider is None and settings.enable_real_market_data:
+        from bistbot.providers.yahoo import YahooFinanceBISTProvider
+
         provider = YahooFinanceBISTProvider(cache_dir=settings.cache_dir)
     app.state.store = InMemoryStore(
         settings,

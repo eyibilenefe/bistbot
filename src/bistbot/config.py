@@ -25,6 +25,9 @@ class Settings:
     research_timeframe: str = "4h"
     backtest_lookback_days: int = 730
     backtest_min_daily_bars: int = 240
+    walk_forward_train_days: int = 60
+    walk_forward_test_days: int = 30
+    walk_forward_step_days: int = 30
     backtest_symbol_summary_limit: int = 0
     backtest_trade_chart_limit: int = 24
     chart_live_lookback_days: int = 10

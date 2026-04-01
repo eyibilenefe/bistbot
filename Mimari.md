@@ -1,128 +1,211 @@
-# BISTBot v1 Mimari
+# BISTBot Mimari
 
-## System Overview
+## Guncel Durum
 
-BISTBot, Borsa Istanbul icin manuel karar destekli, swing trading odakli bir quant research platformudur. Sistem otomatik emir gondermez; setup uretir, backtest yapar, risk hesaplar ve kullanicinin manuel girdigi pozisyonlari takip eder.
+BISTBot su anda tek bir `FastAPI` prosesi icinde hem HTML sayfalarini hem JSON API'yi sunan, gercek BIST verisini `Yahoo Finance` uzerinden ceken ve arastirma snapshot'larini disk onbellege yazan bir research ve paper-trading uygulamasidir.
 
-Teknik yapi:
+Bugunku aktif giris noktalari:
 
-- `FastAPI` tabanli API uygulamasi
-- Python servis katmani ile quant logic
-- PostgreSQL odakli veri modeli
-- `strategy_runs` ve `strategy_scores` icin aylik native partitioning
-- Dashboard ve Backtest yuzeyi icin API-first tasarim
+- `src/bistbot/main.py`: uygulama bootstrap'i
+- `src/bistbot/web/routes.py`: server-rendered sayfalar
+- `src/bistbot/api/routes.py`: JSON API
+- `src/bistbot/storage/memory.py`: aktif runtime state ve is kurallari
+- `src/bistbot/services/jobs.py`: arka plan veri yenileme isleri
 
-V1 scope:
+Uygulama halen "manuel karar destekli" mantigi korur; gercek emir gondermez. Bunun yaninda gercek setup'lardan otomatik bir paper portfoy de turetebilir.
 
-- Point-in-time cluster bazli strateji arastirmasi
-- Quality-gated setup uretimi
-- Manual-entry revalidation
-- Corporate action aware portfoy takibi
-- Portfolio-level risk enforcement
+## Sistem Topolojisi
 
-## Point-in-Time Research Model
+### 1. Delivery Layer
 
-Cluster mantigi `sector x 60-trading-day ATR% volatility tercile` uzerinden kurulur. En kritik kural, cluster atamasinin tarihsel olarak sabitlenmesidir:
+`FastAPI` iki yuzey sunar:
 
-- Her walk-forward step basinda yalniz o ana kadar bilinen veri kullanilir
-- Test penceresi boyunca cluster assignment dondurulur
-- Gelecek volatilite rejimi ile gecmis skor yeniden yazilmaz
+- Web:
+  - `GET /`
+  - `GET /dashboard`
+  - `GET /backtest`
+- API:
+  - market, setup, pozisyon, backtest ve cache-refresh endpoint'leri
 
-Cluster fallback kurallari:
+Web rotalari `Jinja2Templates` ile `src/bistbot/templates` altindaki sayfalari render eder. Tarayici tarafi davranis ve grafik cizimi `src/bistbot/static/app.js` ve `src/bistbot/static/app.css` ile saglanir.
 
-- Bucket boyutu `min_cluster_size` altina duserse once komsu volatilite bucket ile birlesir
-- Hala yetersizse `sector-only` fallback aktif olur
-- Normalizasyon modu cluster boyutuna gore degisir:
-  - `n >= 30`: winsorized z-score
-  - `n < 30`: percentile rank normalization
+### 2. Domain Layer
 
-Bu mantik [clustering.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/clustering.py) ve [normalization.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/normalization.py) icinde uygulanir.
+Temel veri modelleri `src/bistbot/domain/models.py` icinde dataclass olarak tutulur:
 
-## Data & Storage
+- `PriceBar`
+- `ClusterDefinition`
+- `StrategyDefinition`
+- `StrategyScore`
+- `SetupCandidate`
+- `PortfolioPosition`
+- `TradeRecord`
+- `DashboardOverview`
 
-Veri modeli uc katmanda dusunulmustur:
+Durum ve davranis etiketleri `src/bistbot/domain/enums.py` icindedir:
 
-1. Market data
-- `symbols`
-- `bars_1d`
-- `bars_1h`
+- `StrategyFamily`
+- `SetupStatus`
+- `PositionStatus`
+- `ClusterFallbackMode`
+- `CorporateActionType`
+- `JobName`
 
-2. Research state
-- `strategy_definitions`
-- `strategy_runs`
-- `strategy_scores`
-- `setup_candidates`
+### 3. Application State Layer
 
-3. Portfolio state
-- `portfolio_positions`
-- `job_runs`
+Gercek calisan depolama katmani su anda `InMemoryStore` sinifidir. `src/bistbot/storage/base.py` icindeki `StorageRepository` protocol'u store'un sundugu arayuzu tanimlar; `api/routes.py` ve `web/routes.py` bu arayuze dayanir.
 
-PostgreSQL partitioning detayi [schema.sql](/home/mitat/Documents/projects/bistbot/src/bistbot/storage/sql/schema.sql) icindedir. `strategy_runs` ve `strategy_scores` tablolarinda `as_of_date` uzerinden range partitioning kullanilir. Temel indexler:
+`InMemoryStore` su verileri bellekte tutar:
 
-- `(cluster_id, as_of_date desc)`
-- `(strategy_id, as_of_date desc)`
+- sembol-sektor eslesmeleri
+- gunluk veya arastirma amacli bar verileri
+- cluster tanimlari
+- strateji tanimlari ve skorlar
+- aktif setup'lar
+- acik ve kapali paper pozisyonlar
+- backtest trade gecmisi
+- son arastirma snapshot zamani
 
-Corporate action uyumlulugu icin `portfolio_positions` tablosunda su alanlar bulunur:
+### 4. Provider Layer
 
-- `adjustment_factor`
-- `adjusted_entry_price`
-- `adjusted_stop_price`
-- `adjusted_target_price`
-- `last_corporate_action_at`
+Piyasa verisi `src/bistbot/providers/yahoo.py` icindeki `YahooFinanceBISTProvider` ile alinir.
 
-## Strategy Engine
+Bu katman:
 
-Strateji tanimi sadece indikator kombinasyonu degildir; ayni zamanda davranis ailesi tasir:
+- sembol listesini `company_universe.py` uzerinden bilir
+- sektor bilgisini Yahoo verisinden cozer ve cache'ler
+- `1d` ve `1h` veriyi dogrudan indirir
+- `4h` veriyi `1h` barlardan turetir
+- bar verisini `.cache/bistbot/bars/...` altina disk cache olarak yazar
 
-- `trend_following`
-- `pullback_mean_reversion`
-- `breakout_volume`
+`main.py` icinde `enable_real_market_data=True` ise provider otomatik baglanir.
 
-Backtest motoru:
+### 5. Persistence ve Cache Layer
 
-- `24 ay` lookback
-- `60 gun train + 30 gun test`
-- `30 gun step`
+Su anki aktif persistence bir veritabani degil, `DiskCache` tabanli JSON cache yapisidir:
 
-Yeterlilik kurallari:
+- `.cache/bistbot/runtime_state.json`
+- `.cache/bistbot/research_state.json`
+- `.cache/bistbot/bars/<timeframe>/<symbol>.json`
 
-- toplam OOS islem `>= 50`
-- son 6 pencerenin en az 3 tanesinde islem
-- `avg_trade_return >= 2 x estimated_round_trip_cost`
+`InMemoryStore` acilis sirasinda once runtime state'i, sonra research state'i yuklemeyi dener. Boylece uygulama her yeniden basladiginda tum veriyi bastan indirmek zorunda kalmaz.
 
-Skorlama:
+`src/bistbot/storage/sql/schema.sql` repoda duruyor ama bugunku runtime'a bagli degildir. Bu dosya, ileride DB-backed repository'ye gecis icin referans bir schema niteligindedir; aktif veri yolu su anda JSON cache + bellek durumudur.
 
-- metrikler cluster icinde normalize edilir
-- final skor = `0.4*Ret_norm + 0.2*WinRate_norm + 0.3*ProfitFactor_norm - 0.1*MaxDrawdown_norm`
+## Uygulama Baslatma Akisi
 
-Aktif strateji secimi:
+`create_app()` akisi su sekildedir:
 
-- cluster basina `1-3` aktif strateji
-- ayni aileden ikinci strateji secilmez
-- `pairwise OOS return correlation < 0.75`
-- uygun aday yoksa slot bos kalir
+1. `Settings` nesnesi olusturulur.
+2. Gercek veri aciksa `YahooFinanceBISTProvider` initialize edilir.
+3. `InMemoryStore` kurulur.
+4. `JobService` uygulama state'ine eklenir.
+5. `/static` mount edilir.
+6. Web ve API router'lari kaydedilir.
 
-Bu akisin ana modulleri:
+`InMemoryStore` normal calisma modunda su bootstrap adimlarini uygular:
 
-- [scoring.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/scoring.py)
-- [strategy_selection.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/strategy_selection.py)
-- [backtest.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/backtest.py)
+1. Kalici runtime state'i yuklemeyi dener.
+2. Kalici research snapshot'unu yuklemeyi dener.
+3. Provider varsa guncel sembol ve sektor metadata'sini birlestirir.
+4. Pozisyon aciklamalarini ve olasilik metadata'sini backfill eder.
+5. Otomatik paper trading aciksa portfoyu ilk acilista gunceller.
 
-## Signal Lifecycle
+Istenirse `seed_demo_data=True` ile yalniz demo veri ureten mod da vardir.
 
-Setup uretimi quality gate ile sinirlanir. Bir adayin aktif setup olabilmesi icin:
+## Arastirma Motoru
 
-- ayni scan cycle icinde skor olarak top `%10`
-- `expected_R >= 2.0`
-- `confluence_score >= 0.75`
+Arastirma snapshot'u `src/bistbot/services/research.py` icindeki `build_real_research_state()` tarafindan uretilir.
 
-Confluence score bilesenleri:
+Varsayilan ayarlar `src/bistbot/config.py` icinde tanimlidir:
+
+- `research_timeframe = "4h"`
+- `backtest_lookback_days = 730`
+- `walk_forward_train_days = 60`
+- `walk_forward_test_days = 30`
+- `walk_forward_step_days = 30`
+- `min_cluster_size = 8`
+
+Motorun akisi:
+
+1. Provider'dan sembol ve sektor listesi cekilir.
+2. Her sembol icin yeterli lookback bar'i indirilir.
+3. EMA, RSI, ATR, ATR%, hacim orani, ROC, MACD ve breakout seviyeleri hesaplanir.
+4. Son bilinen ATR60% degerleriyle point-in-time snapshot'lar uretilir.
+5. `sector x volatility bucket` temelli cluster'lar olusturulur.
+6. Walk-forward pencereleri uzerinden train/test simulasyonu yapilir.
+7. Her cluster ve strateji ailesi icin OOS trade kayitlari ve metrikler toplanir.
+8. Skorlar cluster bazinda normalize edilir.
+9. Aktif stratejiler secilir.
+10. Setup candidate'lar uretilir ve quality gate'den gecirilir.
+
+## Point-in-Time Clustering
+
+Kumeleme `src/bistbot/services/clustering.py` icinde uygulanir.
+
+Kurallar:
+
+- Snapshot'lar yalniz `as_of` tarihine kadar bilinen veriyle hesaplanir.
+- Her sektor kendi icinde ATR60% degerine gore `low`, `mid`, `high` bucket'larina ayrilir.
+- Bucket sayisi `min_cluster_size` altina dusunce once komsu volatilite bucket ile birlesme olur.
+- Yine yetersiz kalirsa sektor bazli tek cluster'a dusulur.
+
+Fallback modlari:
+
+- `none`
+- `adjacent_volatility_merge`
+- `sector_only`
+
+Walk-forward test pencerelerinde cluster assignment train sonuna gore dondurulur; gelecekteki volatilite rejimi gecmise yazilmaz.
+
+## Skorlama ve Strateji Secimi
+
+Normalization `src/bistbot/services/normalization.py` icindedir:
+
+- `n >= 30` ise winsorized z-score
+- `n < 30` ise percentile rank
+
+Composite score `src/bistbot/services/scoring.py` icinde hesaplanir:
+
+- `0.4 * normalized_return`
+- `0.2 * normalized_win_rate`
+- `0.3 * normalized_profit_factor`
+- `-0.18 * normalized_max_drawdown`
+- `%20` ustu drawdown icin ek ceza
+- `%30` ustu max drawdown stratejiyi otomatik olarak gorunmez yapar
+
+Aktif strateji secimi `src/bistbot/services/strategy_selection.py` icindedir. Bir stratejinin secilebilmesi icin:
+
+- en az `12` OOS trade
+- son alti pencerede en az `2` aktif pencere
+- `avg_trade_return >= 1.25 x estimated_round_trip_cost`
+- max drawdown junk threshold'un altinda kalma
+
+Secim sirasinda:
+
+- aile cesitliligi korunur
+- pairwise OOS return correlation `< 0.75` olmalidir
+- varsayilan maksimum aktif strateji sayisi `3`'tur
+
+## Setup Uretimi ve Yasam Dongusu
+
+Setup adaylari research snapshot sonunda uretilir. Kalite filtresi `quality_gate()` ile uygulanir.
+
+Bugunku varsayilan setup filtreleri:
+
+- ilk `%20` dilim
+- minimum `3` setup tut
+- `expected_r >= 1.5`
+- `confluence_score >= 0.65`
+- varsayilan setup omru `6 saat`
+
+Confluence score agirliklari:
 
 - daily regime `0.30`
 - trend signal `0.25`
 - momentum signal `0.20`
 - volume confirmation `0.15`
-- entry-zone proximity `0.10`
+- entry zone proximity `0.10`
 
 Setup durumlari:
 
@@ -134,100 +217,144 @@ Setup durumlari:
 - `entered`
 - `closed`
 
-Yasam dongusu kurallari:
+Kurallar `src/bistbot/services/setup_lifecycle.py` icindedir. Setup:
 
-- `1H` setup icin varsayilan omur `6 saat`
-- sure dolarsa `expired`
+- suresi dolarsa `expired`
 - daily regime bozulursa `invalidated`
-- fiyat entry zone'dan `0.5 ATR` fazla kacarsa `invalidated`
-- kullanici onayi sonrasinda bile manuel entry aninda tekrar kontrol yapilir
+- entry zone `0.5 ATR` disina tasarsa `invalidated`
+- stop mantigi bozulursa `invalidated`
 
-Bu mantik [setup_lifecycle.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/setup_lifecycle.py) icinde tutulur.
+Manuel entry oncesinde setup bir kez daha dogrulanir.
 
-## Risk Engine
+## Risk, Pozisyon ve Paper Trading
 
-Risk motoru trade ve portfoy seviyesinde ayni anda calisir.
+Pozisyon buyuklugu `src/bistbot/services/risk.py` ile hesaplanir:
 
-Trade-level:
+- risk bazli sizing
+- varsayilan `risk_per_trade = 0.01`
+- long islem icin `entry_price > stop_price` olmasi gerekir
 
-- `%1` risk-based sizing
-- `entry - stop` uzerinden adet hesabi
+Portfoy constraint'leri:
 
-Portfolio-level:
+- sektor basina max `2` pozisyon
+- max sektor maruziyeti `%40`
+- max korelasyon `0.75`
+- toplam portfoy riski `%5`
 
-- max `2` hisse / sektor
-- max `%40` sektor maruziyeti
-- `60 gun correlation > 0.75` ise red
-- total portfolio risk exposure `<= %5`
+Paper trading akisi `InMemoryStore` icinde tutulur:
 
-Portfolio risk exposure formulu:
+- `approve_setup()` ve `reject_setup()` setup kararini yazar
+- `create_manual_position()` manuel girisi validate eder ve constraint kontrolu yapar
+- `auto_paper_trading_enabled` aciksa yenileme sonunda otomatik paper entry yapilabilir
+- refresh basina en fazla `5` yeni pozisyon acilir
+- acik pozisyonlar varsayilan her `120` saniyede bir guncellenir
 
-`sum(max(last_price - stop_price, 0) * qty) / portfolio_equity`
+Pozisyon guncelleme davranislari:
 
-Holding logic:
+- fiyat `1R` ilerlerse stop breakeven'a cekilir
+- fiyat `2R` ilerlerse stop `+1R` seviyesine cekilir
+- hedefe gelindiginde soft-limit kurali pozisyonu acik tutmaya izin vermezse pozisyon kapanir
+- `7` gun soft limit sonrasi sadece `daily close > EMA20 > EMA50` ise pozisyon korunur
 
-- `1-7 gun` hedef pencere soft limit olarak ele alinir
-- 7. gun sonrasinda `daily close > EMA20` ve `EMA20 > EMA50` ise pozisyon korunabilir
+## Corporate Action ve Veri Kalitesi
 
-Bu alanin ana modulleri:
+Corporate action ayarlari `src/bistbot/services/portfolio_adjustments.py` icindedir:
 
-- [risk.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/risk.py)
-- [position_management.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/position_management.py)
-- [portfolio_adjustments.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/portfolio_adjustments.py)
+- split ve bonus durumunda adet carpilir, anchor fiyatlar bolunur
+- cash dividend durumunda fiyat anchor'lari asagi ayarlanir ve nakit bakiyesi artar
 
-## Data Quality
+Veri kalitesi kontrolleri `src/bistbot/services/data_quality.py` icindedir:
 
-Veri kalite katmani corporate action ile aciklanamayan anormal gap'leri karantinaya alir.
+- aciklanamayan gap'ler tespit edilir
+- ayni gunde corporate action varsa gap kabul edilir
+- aksi halde `unexplained_gap` eventi uretilir
 
-Kurallar:
+Bu katman su an research refresh akisinin merkezi parcasindan cok destekleyici servis niteligindedir.
 
-- buyuk gap tespit edilir
-- ayni gun corporate action varsa kabul edilir
-- aciklama yoksa sembol quarantine edilir
+## Dashboard ve Backtest Sayfalari
 
-Ayrica corporate action geldiginde acik pozisyonlar da senkron ayarlanir:
+Web yuzeyi store'un sayfa-verisi helper'larini kullanir.
 
-- split/bedelsiz: quantity carpilir, price anchor'lar bolunur
-- cash dividend: quantity sabit kalir, adjusted anchor'lar dusurulur, simule nakit bakiyesi artar
+`get_dashboard_page_data()` su bolumleri besler:
 
-Bu akisin kodu:
+- overview kartlari
+- gercek piyasa watchlist'i
+- top setup kartlari
+- acik pozisyon tablosu
+- strateji insight listeleri
+- canli trade grafik payload'lari
 
-- [data_quality.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/data_quality.py)
-- [portfolio_adjustments.py](/home/mitat/Documents/projects/bistbot/src/bistbot/services/portfolio_adjustments.py)
+`get_backtest_page_data()` su bolumleri besler:
 
-## APIs
+- cluster siralamasi
+- hisse bazli backtest ozeti
+- lider ve zayif strateji insight'lari
+- recent trades listesi
+- secilebilir backtest sembol browser'i
+- trade chart payload'lari
 
-Uygulama bootstrap dosyasi [main.py](/home/mitat/Documents/projects/bistbot/src/bistbot/main.py), API router dosyasi [routes.py](/home/mitat/Documents/projects/bistbot/src/bistbot/api/routes.py).
+Grafik payload'lari `src/bistbot/services/charting.py` ile uretilir. Frontend bu payload'lari tarayici tarafinda render eder.
 
-Sunulan endpointler:
+## Cache Refresh ve Background Isler
+
+Anlik veri yenileme iki asamada calisir:
+
+1. `POST /api/cache/refresh`
+2. `GET /api/cache/refresh/{job_id}`
+
+`JobService.start_refresh()` tekil bir refresh isi olusturur ve arka planda thread baslatir. Bu is:
+
+- progres bilgisini tutar
+- ayni anda birden fazla refresh calismasini engeller
+- tamamlandiginda sonucu ve hata bilgisini store eder
+
+`POST /api/jobs/{job_name}/run` endpoint'i ise simdilik stub nitelikli manuel job kaydi uretir.
+
+## Guncel API Yuzeyi
+
+Aktif JSON API endpoint'leri:
 
 - `GET /api/dashboard/overview`
+- `GET /api/market/symbols`
+- `GET /api/market/charts/{symbol}`
 - `GET /api/setups/top`
-- `GET /api/setups/{id}`
-- `POST /api/setups/{id}/approve`
-- `POST /api/setups/{id}/reject`
+- `GET /api/setups/{setup_id}`
+- `POST /api/setups/{setup_id}/approve`
+- `POST /api/setups/{setup_id}/reject`
 - `POST /api/positions/manual-entry`
-- `PATCH /api/positions/{id}`
+- `PATCH /api/positions/{position_id}`
 - `GET /api/positions`
 - `GET /api/backtests/clusters`
+- `GET /api/backtests/symbols`
+- `GET /api/backtests/symbols/{symbol}`
 - `GET /api/backtests/clusters/{cluster_id}/strategies`
 - `GET /api/backtests/strategies/{strategy_id}/trades`
 - `POST /api/jobs/{job_name}/run`
+- `POST /api/cache/refresh`
+- `GET /api/cache/refresh/{job_id}`
 
-V1 veri akisi icin runtime store olarak [memory.py](/home/mitat/Documents/projects/bistbot/src/bistbot/storage/memory.py) kullanilir. Bu katman demo seed verisi ile uygulamayi ayaga kaldirir ve daha sonra DB-backed repository ile degistirilebilir.
+## Test Stratejisi
 
-## Testing
+Testler `tests/` altinda yer alir ve ana davranislari kapsar:
 
-Test coverage hedefleri:
+- clustering
+- normalization
+- scoring ve strategy selection
+- costs
+- setup lifecycle
+- risk ve portfolio adjustments
+- charting
+- research build akisi
+- API endpoint smoke test'leri
+- paper trading davranislari
 
-- PIT cluster assignment
-- normalization mode switch
-- family diversity + correlation based strategy selection
-- dynamic cost behavior
-- setup expiration / invalidation / manual-entry revalidation
-- data quality quarantine
-- corporate action position adjustment
-- position sizing ve portfolio risk cap
-- API smoke flow
+## Mimari Karari Ozeti
 
-Testler `pytest` ile [tests](/home/mitat/Documents/projects/bistbot/tests) altinda yer alir.
+Bugunku mimari, DB-first bir sistemden cok "FastAPI + in-memory application state + disk cache + real market provider" modelidir. Bunun avantajlari:
+
+- hizli yerel gelistirme
+- sifira yakin kurulum maliyeti
+- cache uzerinden hizli yeniden baslatma
+- tek process icinde UI, API ve research mantiginin birlikte calismasi
+
+Bugunku trade-off ise application state'in halen repository/veritabani ayrimina tam tasinmamis olmasidir. `StorageRepository` protocol'u ve `schema.sql`, ileride kalici DB-backed mimariye gecis icin hazir bir gecis noktasi sunar.

@@ -8,6 +8,7 @@ from typing import Callable
 from bistbot.config import Settings
 from bistbot.domain.enums import (
     ClusterFallbackMode,
+    LifecycleEventType,
     PositionStatus,
     SetupStatus,
     StrategyFamily,
@@ -16,6 +17,7 @@ from bistbot.domain.models import (
     ClusterDefinition,
     CorporateAction,
     DashboardOverview,
+    LifecycleEvent,
     PriceBar,
     PortfolioPosition,
     ProposedPosition,
@@ -31,6 +33,23 @@ from bistbot.services.charting import (
     build_price_marker,
 )
 from bistbot.services.position_management import should_keep_position_open
+from bistbot.services.presentation import (
+    build_lifecycle_event_view,
+    build_position_entry_reason,
+    build_position_view,
+    build_setup_thesis,
+    build_setup_view,
+    build_watchlist_row_view,
+    compute_expected_r,
+    format_probability_pct,
+    is_finite_number,
+    normalize_probability,
+    require_finite_number,
+    require_positive_int,
+    require_probability,
+    sanitize_chart_payload,
+    validate_long_trade_values,
+)
 from bistbot.services.portfolio_adjustments import adjust_position_for_corporate_action
 from bistbot.services.research import build_real_research_state, compute_indicators
 from bistbot.services.risk import calculate_position_size, evaluate_position_constraints
@@ -39,11 +58,14 @@ from bistbot.services.setup_lifecycle import (
     approve_setup,
     compute_confluence_score,
     quality_gate,
+    refresh_setup_status,
     reject_setup,
-    validate_manual_entry,
 )
 from bistbot.services.strategy_selection import select_active_strategies
 from bistbot.storage.disk_cache import DiskCache
+
+RESEARCH_STATE_SCHEMA_VERSION = 2
+MAX_LIFECYCLE_EVENTS = 200
 
 
 class InMemoryStore:
@@ -72,10 +94,12 @@ class InMemoryStore:
         self.setups: dict[str, SetupCandidate] = {}
         self.positions: dict[str, PortfolioPosition] = {}
         self.backtest_trades: dict[str, list[TradeRecord]] = {}
+        self.lifecycle_events: list[LifecycleEvent] = []
         self.research_cached_at: datetime | None = None
         self._last_live_positions_refresh_at: datetime | None = None
         self._real_data_attempted = seed_demo_data
         self._real_data_loaded = False
+        self._event_sequence = 0
         self.correlation_map: dict[tuple[str, str], float] = {
             ("AKBNK", "YKBNK"): 0.82,
             ("AKBNK", "TUPRS"): 0.24,
@@ -88,7 +112,7 @@ class InMemoryStore:
             self._load_cached_runtime_state()
             self._load_cached_research_state()
             self._load_real_symbol_metadata()
-            self._backfill_position_reasons()
+            self._backfill_position_metadata()
             self._bootstrap_paper_portfolio()
 
     def _seed_demo_data(self) -> None:
@@ -278,6 +302,8 @@ class InMemoryStore:
             ]
         )
         self.strategy_scores = {score.strategy_id: score for score in cluster_scores}
+        for score in self.strategy_scores.values():
+            score.walk_forward_window_count = len(score.oos_window_trade_counts)
 
         scores_by_cluster: dict[str, list[StrategyScore]] = {}
         for score in cluster_scores:
@@ -348,6 +374,7 @@ class InMemoryStore:
             min_confluence_score=self.settings.setup_min_confluence_score,
         )
         self.setups = {setup.id: self._enrich_setup(setup) for setup in active_setups}
+        self._record_setup_created_events(list(self.setups.values()))
 
         existing_position = PortfolioPosition(
             id="pos-1",
@@ -366,6 +393,8 @@ class InMemoryStore:
             adjusted_target_price=228.0,
         )
         self.positions[existing_position.id] = existing_position
+        self._backfill_position_metadata()
+        self._record_position_entered_event(position=existing_position, occurred_at=existing_position.opened_at)
 
         self.backtest_trades = {
             "strat-trend-bank": [
@@ -484,14 +513,19 @@ class InMemoryStore:
 
         markers: list[dict[str, object]] = []
         price_lines: list[dict[str, object]] = []
+        hidden_overlays = 0
 
         for position in self.positions.values():
             if position.status != PositionStatus.OPEN or position.symbol != normalized_symbol:
                 continue
+            position_view = self._build_position_view(position)
+            if bool(position_view["is_degraded"]):
+                hidden_overlays += 1
+                continue
             markers.append(
                 build_price_marker(
                     timestamp=position.opened_at,
-                    text=f"Giris {position.entry_price:.2f}",
+                    text=f"Giris {float(position_view['entry_price']):.2f}",
                     color="#0d8a76",
                     shape="arrowUp",
                     position="belowBar",
@@ -500,35 +534,49 @@ class InMemoryStore:
             price_lines.extend(
                 [
                     build_price_line(
-                        value=position.stop_price,
-                        title=f"Stop {position.stop_price:.2f}",
+                        value=float(position_view["stop_price"]),
+                        title=f"Stop {float(position_view['stop_price']):.2f}",
                         color="#b33c2b",
                     ),
                     build_price_line(
-                        value=position.target_price,
-                        title=f"Hedef {position.target_price:.2f}",
+                        value=float(position_view["target_price"]),
+                        title=f"Hedef {float(position_view['target_price']):.2f}",
                         color="#b57a18",
                     ),
                 ]
             )
 
-        chart = build_candlestick_chart(
-            symbol=normalized_symbol,
-            title=f"{normalized_symbol} Gunluk Grafik",
-            subtitle="Gercek BIST gunluk mumlar, onbellekten hizli yuklenir ve sadece eksik veri guncellenir",
-            bars=bars,
-            markers=markers,
-            price_lines=price_lines,
+        chart = sanitize_chart_payload(
+            build_candlestick_chart(
+                symbol=normalized_symbol,
+                title=f"{normalized_symbol} Gunluk Grafik",
+                subtitle="Gercek BIST gunluk mumlar, onbellekten hizli yuklenir ve sadece eksik veri guncellenir",
+                bars=bars,
+                markers=markers,
+                price_lines=price_lines,
+            )
         )
         chart["data_source"] = "Yahoo Finance (.IS) + disk onbellek"
         chart["sector"] = self.symbol_sectors.get(normalized_symbol, "unknown")
         chart["bar_count"] = len(bars)
         chart["cached_at"] = self.research_cached_at.isoformat() if self.research_cached_at else None
+        chart["filtered_position_overlay_count"] = hidden_overlays
+        if hidden_overlays:
+            chart["is_degraded"] = True
+            chart["degraded_reasons"] = list(
+                dict.fromkeys([*chart.get("degraded_reasons", []), "degraded_position_overlays_hidden"])
+            )
         return chart
 
     def get_dashboard_overview(self) -> DashboardOverview:
         self._refresh_open_positions_if_due()
-        open_positions = [position for position in self.positions.values() if position.status == PositionStatus.OPEN]
+        open_positions = [
+            position
+            for position in self.positions.values()
+            if position.status == PositionStatus.OPEN
+            and is_finite_number(position.last_price)
+            and position.quantity > 0
+        ]
         total_value = self.cash_balance + sum(position.last_price * position.quantity for position in open_positions)
         return DashboardOverview(
             total_value=round(total_value, 2),
@@ -542,6 +590,336 @@ class InMemoryStore:
             ),
             open_positions=len(open_positions),
         )
+
+    def list_top_setup_views(self, *, limit: int = 3) -> list[dict[str, object]]:
+        now = datetime.now(UTC)
+        return [self._build_setup_view(setup, now=now) for setup in self.list_top_setups(limit=limit)]
+
+    def get_setup_view(self, setup_id: str) -> dict[str, object] | None:
+        setup = self.get_setup(setup_id)
+        if setup is None:
+            return None
+        return self._build_setup_view(setup, now=datetime.now(UTC))
+
+    def get_position_view(self, position_id: str) -> dict[str, object] | None:
+        position = self.get_position(position_id)
+        if position is None:
+            return None
+        return self._build_position_view(position)
+
+    def list_position_views(self) -> list[dict[str, object]]:
+        self._refresh_open_positions_if_due()
+        return [self._build_position_view(position) for position in self.positions.values()]
+
+    def list_paper_trade_history(self, *, limit: int | None = None) -> list[dict[str, object]]:
+        self._refresh_open_positions_if_due()
+        rows = [
+            self._build_position_history_view(position)
+            for position in self.positions.values()
+            if position.status == PositionStatus.CLOSED
+        ]
+        rows.sort(
+            key=lambda item: (
+                item["closed_at"] or item["opened_at"],
+                item["opened_at"],
+            ),
+            reverse=True,
+        )
+        return rows[:limit] if limit is not None else rows
+
+    def get_lifecycle_events(self, *, limit: int = 20) -> list[dict[str, object]]:
+        ordered = sorted(self.lifecycle_events, key=lambda event: event.occurred_at, reverse=True)
+        return [build_lifecycle_event_view(event) for event in ordered[:limit]]
+
+    def _build_setup_view(
+        self,
+        setup: SetupCandidate,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        enriched = self._enrich_setup(setup)
+        strategy = self.strategies.get(
+            enriched.strategy_id,
+            StrategyDefinition(
+                id=enriched.strategy_id,
+                name=enriched.strategy_id,
+                family=enriched.strategy_family,
+                trend_indicator="trend",
+                momentum_indicator="momentum",
+                volume_indicator="hacim",
+            ),
+        )
+        cluster = self.clusters.get(enriched.cluster_id)
+        cluster_label = enriched.cluster_id
+        if cluster is not None:
+            cluster_label = f"{cluster.sector} / {cluster.vol_bucket}"
+        return build_setup_view(
+            setup=enriched,
+            strategy_name=strategy.name,
+            strategy_family_label=self._family_label(enriched.strategy_family),
+            sector=self.symbol_sectors.get(enriched.symbol, "unknown"),
+            cluster_label=cluster_label,
+            trend_indicator=strategy.trend_indicator or "trend",
+            momentum_indicator=strategy.momentum_indicator or "momentum",
+            volume_indicator=strategy.volume_indicator or "hacim",
+            now=now,
+        )
+
+    def _build_position_view(self, position: PortfolioPosition) -> dict[str, object]:
+        related_setup = self._resolve_related_setup_for_position(position)
+        self._hydrate_position_entry_context(position, related_setup=related_setup)
+        base_thesis = (
+            related_setup.thesis
+            if related_setup is not None and related_setup.thesis
+            else f"{position.symbol} icin paper-trading pozisyonu {position.sector} grubunda izleniyor."
+        )
+        view = build_position_view(position=position, base_thesis=base_thesis)
+        position.entry_reason = str(view["entry_reason"])
+        if view["success_probability"] is not None:
+            position.success_probability = float(view["success_probability"])
+        if position.expected_r_at_entry is None and view["expected_r_at_entry"] is not None:
+            position.expected_r_at_entry = float(view["expected_r_at_entry"])
+        return view
+
+    def _build_position_history_view(self, position: PortfolioPosition) -> dict[str, object]:
+        view = self._build_position_view(position)
+        exit_price = view["last_price"] if position.status == PositionStatus.CLOSED else None
+        realized_return_pct = None
+        realized_pnl = None
+        if (
+            position.status == PositionStatus.CLOSED
+            and view["entry_price"] is not None
+            and view["last_price"] is not None
+            and view["quantity"] is not None
+            and float(view["entry_price"]) > 0
+        ):
+            realized_return_pct = round(
+                ((float(view["last_price"]) - float(view["entry_price"])) / float(view["entry_price"])) * 100,
+                2,
+            )
+            realized_pnl = round(
+                (float(view["last_price"]) - float(view["entry_price"])) * int(view["quantity"]),
+                2,
+            )
+        holding_days = None
+        if position.closed_at is not None:
+            holding_days = round(
+                max((position.closed_at - position.opened_at).total_seconds(), 0.0) / 86400,
+                1,
+            )
+        return {
+            **view,
+            "exit_price": exit_price,
+            "realized_return_pct": realized_return_pct,
+            "realized_pnl": realized_pnl,
+            "holding_days": holding_days,
+            "close_reason": self._close_reason_label(self._find_position_close_reason(position.id)),
+        }
+
+    def _resolve_related_setup_for_position(
+        self,
+        position: PortfolioPosition,
+    ) -> SetupCandidate | None:
+        if position.source_setup_id is not None:
+            related_setup = self.setups.get(position.source_setup_id)
+            if related_setup is not None:
+                return self._enrich_setup(related_setup)
+        return self._find_related_setup_for_symbol(position.symbol)
+
+    def _hydrate_position_entry_context(
+        self,
+        position: PortfolioPosition,
+        related_setup: SetupCandidate | None = None,
+    ) -> None:
+        if related_setup is None:
+            related_setup = self._resolve_related_setup_for_position(position)
+        if related_setup is not None and position.source_setup_id is None:
+            position.source_setup_id = related_setup.id
+        if position.initial_stop_price is None:
+            position.initial_stop_price = (
+                related_setup.stop
+                if related_setup is not None and is_finite_number(related_setup.stop)
+                else position.stop_price
+            )
+        if position.initial_target_price is None:
+            position.initial_target_price = (
+                related_setup.target
+                if related_setup is not None and is_finite_number(related_setup.target)
+                else position.target_price
+            )
+        if position.expected_r_at_entry is None:
+            if related_setup is not None and is_finite_number(related_setup.expected_r):
+                position.expected_r_at_entry = float(related_setup.expected_r)
+            else:
+                position.expected_r_at_entry = compute_expected_r(
+                    entry_price=position.entry_price,
+                    stop_price=position.initial_stop_price,
+                    target_price=position.initial_target_price,
+                )
+        if position.confidence_at_entry is None:
+            if related_setup is not None:
+                position.confidence_at_entry = normalize_probability(related_setup.confidence)
+            else:
+                position.confidence_at_entry = normalize_probability(position.success_probability)
+        if position.success_probability is None:
+            position.success_probability = position.confidence_at_entry
+
+    def _record_lifecycle_event(
+        self,
+        *,
+        event_type: LifecycleEventType,
+        occurred_at: datetime,
+        symbol: str | None = None,
+        setup_id: str | None = None,
+        position_id: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        self._event_sequence += 1
+        event = LifecycleEvent(
+            id=f"event-{self._event_sequence}",
+            event_type=event_type,
+            occurred_at=occurred_at,
+            symbol=symbol,
+            setup_id=setup_id,
+            position_id=position_id,
+            details=dict(details or {}),
+        )
+        self.lifecycle_events.append(event)
+        if len(self.lifecycle_events) > MAX_LIFECYCLE_EVENTS:
+            self.lifecycle_events = self.lifecycle_events[-MAX_LIFECYCLE_EVENTS:]
+
+    def _record_setup_created_events(self, setups: list[SetupCandidate]) -> None:
+        for setup in setups:
+            self._record_lifecycle_event(
+                event_type=LifecycleEventType.SETUP_CREATED,
+                occurred_at=setup.created_at,
+                symbol=setup.symbol,
+                setup_id=setup.id,
+                details={
+                    "symbol": setup.symbol,
+                    "strategy_id": setup.strategy_id,
+                    "score": setup.score,
+                },
+            )
+
+    def _record_setup_transition(
+        self,
+        previous: SetupCandidate,
+        updated: SetupCandidate,
+        *,
+        occurred_at: datetime,
+    ) -> None:
+        if previous.status == updated.status:
+            return
+        if updated.status == SetupStatus.APPROVED_PENDING_ENTRY:
+            event_type = LifecycleEventType.SETUP_APPROVED
+        elif updated.status == SetupStatus.EXPIRED:
+            event_type = LifecycleEventType.SETUP_EXPIRED
+        elif updated.status == SetupStatus.INVALIDATED:
+            event_type = LifecycleEventType.SETUP_INVALIDATED
+        else:
+            return
+        details: dict[str, object] = {"symbol": updated.symbol}
+        if updated.invalidated_reason:
+            details["reason"] = updated.invalidated_reason
+        self._record_lifecycle_event(
+            event_type=event_type,
+            occurred_at=occurred_at,
+            symbol=updated.symbol,
+            setup_id=updated.id,
+            details=details,
+        )
+
+    def _record_position_entered_event(
+        self,
+        *,
+        position: PortfolioPosition,
+        occurred_at: datetime,
+    ) -> None:
+        self._record_lifecycle_event(
+            event_type=LifecycleEventType.POSITION_ENTERED,
+            occurred_at=occurred_at,
+            symbol=position.symbol,
+            setup_id=position.source_setup_id,
+            position_id=position.id,
+            details={
+                "symbol": position.symbol,
+                "entry_price": position.entry_price,
+                "stop_price": position.stop_price,
+                "target_price": position.target_price,
+                "quantity": position.quantity,
+            },
+        )
+
+    def _record_position_stop_event(
+        self,
+        *,
+        position: PortfolioPosition,
+        occurred_at: datetime,
+        from_stop: float,
+        to_stop: float,
+        moved_to_plus_1r: bool,
+    ) -> None:
+        self._record_lifecycle_event(
+            event_type=(
+                LifecycleEventType.STOP_MOVED_TO_PLUS_1R
+                if moved_to_plus_1r
+                else LifecycleEventType.STOP_MOVED_TO_BREAKEVEN
+            ),
+            occurred_at=occurred_at,
+            symbol=position.symbol,
+            setup_id=position.source_setup_id,
+            position_id=position.id,
+            details={
+                "symbol": position.symbol,
+                "from_stop": from_stop,
+                "to_stop": to_stop,
+            },
+        )
+
+    def _record_position_closed_event(
+        self,
+        *,
+        position: PortfolioPosition,
+        occurred_at: datetime,
+        exit_price: float,
+        close_reason: str,
+    ) -> None:
+        self._record_lifecycle_event(
+            event_type=LifecycleEventType.POSITION_CLOSED,
+            occurred_at=occurred_at,
+            symbol=position.symbol,
+            setup_id=position.source_setup_id,
+            position_id=position.id,
+            details={
+                "symbol": position.symbol,
+                "exit_price": exit_price,
+                "quantity": position.quantity,
+                "close_reason": close_reason,
+            },
+        )
+
+    def _find_position_close_reason(self, position_id: str) -> str | None:
+        for event in reversed(self.lifecycle_events):
+            if (
+                event.position_id == position_id
+                and event.event_type == LifecycleEventType.POSITION_CLOSED
+            ):
+                close_reason = event.details.get("close_reason")
+                return str(close_reason) if close_reason else None
+        return None
+
+    @staticmethod
+    def _close_reason_label(close_reason: str | None) -> str | None:
+        if close_reason is None:
+            return None
+        labels = {
+            "manual_close": "Manuel kapama",
+            "stop_hit": "Stop tetiklendi",
+            "target_hit": "Hedefe ulasildi",
+            "soft_limit_close": "Soft limit kapamasi",
+        }
+        return labels.get(close_reason, close_reason.replace("_", " ").strip().title())
 
     def list_top_setups(self, *, limit: int = 3) -> list[SetupCandidate]:
         self._ensure_real_research_data()
@@ -558,8 +936,10 @@ class InMemoryStore:
 
     def approve_setup(self, setup_id: str) -> SetupCandidate:
         setup = self._require_setup(setup_id)
-        updated = approve_setup(setup, now=datetime.now(UTC))
+        now = datetime.now(UTC)
+        updated = approve_setup(setup, now=now)
         self.setups[setup_id] = updated
+        self._record_setup_transition(setup, updated, occurred_at=now)
         self._persist_runtime_state()
         return updated
 
@@ -579,22 +959,44 @@ class InMemoryStore:
         quantity: int | None,
     ) -> PortfolioPosition:
         setup = self._require_setup(setup_id)
-        validate_manual_entry(setup, now=filled_at)
+        refreshed = refresh_setup_status(
+            setup,
+            now=filled_at,
+            daily_regime_valid=True,
+            entry_distance_atr=0.0,
+            stop_logic_intact=True,
+        )
+        if refreshed.status != setup.status:
+            self.setups[setup_id] = refreshed
+            self._record_setup_transition(setup, refreshed, occurred_at=filled_at)
+            self._persist_runtime_state()
+        if refreshed.status != SetupStatus.APPROVED_PENDING_ENTRY:
+            raise ValueError("Setup is no longer eligible for manual entry.")
+        setup = refreshed
+        resolved_fill_price, _, _ = validate_long_trade_values(
+            entry_price=require_finite_number("fill_price", fill_price),
+            stop_price=setup.stop,
+            target_price=setup.target,
+        )
 
         portfolio_equity = self.get_dashboard_overview().total_value
-        resolved_quantity = quantity or calculate_position_size(
-            portfolio_equity=portfolio_equity,
-            entry_price=fill_price,
-            stop_price=setup.stop,
-            risk_per_trade=self.settings.risk_per_trade,
+        resolved_quantity = (
+            require_positive_int("quantity", quantity)
+            if quantity is not None
+            else calculate_position_size(
+                portfolio_equity=portfolio_equity,
+                entry_price=resolved_fill_price,
+                stop_price=setup.stop,
+                risk_per_trade=self.settings.risk_per_trade,
+            )
         )
 
         proposed_position = ProposedPosition(
             symbol=setup.symbol,
             sector=self.symbol_sectors.get(setup.symbol, "unknown"),
-            entry_price=fill_price,
+            entry_price=resolved_fill_price,
             stop_price=setup.stop,
-            last_price=fill_price,
+            last_price=resolved_fill_price,
             quantity=resolved_quantity,
         )
         evaluation = evaluate_position_constraints(
@@ -616,20 +1018,28 @@ class InMemoryStore:
             symbol=setup.symbol,
             sector=proposed_position.sector,
             status=PositionStatus.OPEN,
-            entry_price=fill_price,
+            entry_price=resolved_fill_price,
             stop_price=setup.stop,
             target_price=setup.target,
             quantity=resolved_quantity,
-            last_price=fill_price,
+            last_price=resolved_fill_price,
             opened_at=filled_at,
-            entry_reason=self._build_position_entry_reason(setup=setup, fill_price=fill_price),
-            adjusted_entry_price=fill_price,
+            success_probability=normalize_probability(setup.confidence),
+            adjusted_entry_price=resolved_fill_price,
             adjusted_stop_price=setup.stop,
             adjusted_target_price=setup.target,
+            source_setup_id=setup.id,
+            initial_stop_price=setup.stop,
+            initial_target_price=setup.target,
+            expected_r_at_entry=setup.expected_r,
+            confidence_at_entry=normalize_probability(setup.confidence),
         )
+        self._hydrate_position_entry_context(position, related_setup=setup)
+        position.entry_reason = self._build_position_view(position)["entry_reason"]
         self.positions[position.id] = position
         setup.status = SetupStatus.ENTERED
-        self.cash_balance -= fill_price * resolved_quantity
+        self.cash_balance -= resolved_fill_price * resolved_quantity
+        self._record_position_entered_event(position=position, occurred_at=filled_at)
         self._persist_runtime_state()
         return position
 
@@ -644,18 +1054,36 @@ class InMemoryStore:
         closed_at: datetime | None = None,
     ) -> PortfolioPosition:
         position = self.positions[position_id]
+        current_stop = stop_price if stop_price is not None else position.stop_price
+        current_target = target_price if target_price is not None else position.target_price
+        validate_long_trade_values(
+            entry_price=position.entry_price,
+            stop_price=current_stop,
+            target_price=current_target,
+        )
         if stop_price is not None:
-            position.stop_price = stop_price
-            position.adjusted_stop_price = stop_price
+            position.stop_price = require_finite_number("stop_price", stop_price)
+            position.adjusted_stop_price = position.stop_price
         if target_price is not None:
-            position.target_price = target_price
-            position.adjusted_target_price = target_price
+            position.target_price = require_finite_number("target_price", target_price)
+            position.adjusted_target_price = position.target_price
         if last_price is not None:
-            position.last_price = last_price
+            position.last_price = require_finite_number("last_price", last_price)
+        if status is not None and status not in {PositionStatus.OPEN.value, PositionStatus.CLOSED.value}:
+            raise ValueError("Unsupported position status.")
         if status == PositionStatus.CLOSED.value:
+            if not is_finite_number(position.last_price):
+                raise ValueError("last_price must be finite when closing a position.")
             position.status = PositionStatus.CLOSED
             position.closed_at = closed_at or datetime.now(UTC)
             self.cash_balance += position.last_price * position.quantity
+            self._record_position_closed_event(
+                position=position,
+                occurred_at=position.closed_at,
+                exit_price=position.last_price,
+                close_reason="manual_close",
+            )
+        self._build_position_view(position)
         self._persist_runtime_state()
         return position
 
@@ -691,6 +1119,7 @@ class InMemoryStore:
         for position in list(self.positions.values()):
             if position.status != PositionStatus.OPEN:
                 continue
+            self._hydrate_position_entry_context(position)
 
             bars = self.bars_by_symbol.get(position.symbol, [])
             if not bars:
@@ -705,24 +1134,57 @@ class InMemoryStore:
                 continue
 
             latest_bar = bars[-1]
+            if not (
+                is_finite_number(latest_bar.close)
+                and is_finite_number(latest_bar.low)
+                and is_finite_number(latest_bar.high)
+            ):
+                continue
             position.last_price = latest_bar.close
-            risk_per_share = max(position.entry_price - position.stop_price, 0.0)
+            initial_stop = (
+                position.initial_stop_price
+                if position.initial_stop_price is not None
+                else position.stop_price
+            )
+            risk_per_share = max(position.entry_price - initial_stop, 0.0)
 
             if risk_per_share > 0:
-                if latest_bar.close >= position.entry_price + risk_per_share:
-                    position.stop_price = max(position.stop_price, position.entry_price)
+                old_stop = position.stop_price
+                moved_to_plus_1r = False
+                moved_to_breakeven = False
                 if latest_bar.close >= position.entry_price + (2 * risk_per_share):
                     position.stop_price = max(
                         position.stop_price,
                         position.entry_price + risk_per_share,
                     )
+                    moved_to_plus_1r = position.stop_price > old_stop
+                elif latest_bar.close >= position.entry_price + risk_per_share:
+                    position.stop_price = max(position.stop_price, position.entry_price)
+                    moved_to_breakeven = position.stop_price > old_stop
                 position.adjusted_stop_price = position.stop_price
+                if moved_to_plus_1r:
+                    self._record_position_stop_event(
+                        position=position,
+                        occurred_at=latest_bar.timestamp,
+                        from_stop=old_stop,
+                        to_stop=position.stop_price,
+                        moved_to_plus_1r=True,
+                    )
+                elif moved_to_breakeven:
+                    self._record_position_stop_event(
+                        position=position,
+                        occurred_at=latest_bar.timestamp,
+                        from_stop=old_stop,
+                        to_stop=position.stop_price,
+                        moved_to_plus_1r=False,
+                    )
 
             if latest_bar.low <= position.stop_price:
                 self._close_simulated_position(
                     position=position,
                     exit_price=position.stop_price,
                     closed_at=latest_bar.timestamp,
+                    close_reason="stop_hit",
                 )
                 closed_count += 1
                 continue
@@ -737,6 +1199,7 @@ class InMemoryStore:
                     position=position,
                     exit_price=position.target_price,
                     closed_at=latest_bar.timestamp,
+                    close_reason="target_hit",
                 )
                 closed_count += 1
                 continue
@@ -746,6 +1209,7 @@ class InMemoryStore:
                     position=position,
                     exit_price=latest_bar.close,
                     closed_at=latest_bar.timestamp,
+                    close_reason="soft_limit_close",
                 )
                 closed_count += 1
 
@@ -768,8 +1232,18 @@ class InMemoryStore:
         for setup in candidates:
             if opened_count >= self.settings.auto_paper_max_new_positions_per_refresh:
                 break
-            if now >= setup.expires_at:
-                setup.status = SetupStatus.EXPIRED
+            refreshed = refresh_setup_status(
+                setup,
+                now=now,
+                daily_regime_valid=True,
+                entry_distance_atr=0.0,
+                stop_logic_intact=True,
+            )
+            if refreshed.status != setup.status:
+                self.setups[setup.id] = refreshed
+                self._record_setup_transition(setup, refreshed, occurred_at=now)
+                setup = refreshed
+            if setup.status != SetupStatus.ACTIVE:
                 continue
             if setup.symbol in open_symbols:
                 continue
@@ -785,8 +1259,16 @@ class InMemoryStore:
             if not bars:
                 continue
             latest_bar = bars[-1]
-            fill_price = min(max(latest_bar.close, setup.entry_low), setup.entry_high)
-            if fill_price <= setup.stop:
+            if not is_finite_number(latest_bar.close):
+                continue
+            fill_price = min(max(float(latest_bar.close), setup.entry_low), setup.entry_high)
+            try:
+                fill_price, _, _ = validate_long_trade_values(
+                    entry_price=fill_price,
+                    stop_price=setup.stop,
+                    target_price=setup.target,
+                )
+            except ValueError:
                 continue
 
             portfolio_equity = self.get_dashboard_overview().total_value
@@ -837,14 +1319,22 @@ class InMemoryStore:
                 quantity=resolved_quantity,
                 last_price=latest_bar.close,
                 opened_at=latest_bar.timestamp,
-                entry_reason=self._build_position_entry_reason(setup=setup, fill_price=fill_price),
                 adjusted_entry_price=fill_price,
                 adjusted_stop_price=setup.stop,
                 adjusted_target_price=setup.target,
+                source_setup_id=setup.id,
+                initial_stop_price=setup.stop,
+                initial_target_price=setup.target,
+                expected_r_at_entry=setup.expected_r,
+                confidence_at_entry=normalize_probability(setup.confidence),
+                success_probability=normalize_probability(setup.confidence),
             )
+            self._hydrate_position_entry_context(position, related_setup=setup)
+            position.entry_reason = self._build_position_view(position)["entry_reason"]
             self.positions[position.id] = position
             self.cash_balance -= fill_price * resolved_quantity
             setup.status = SetupStatus.ENTERED
+            self._record_position_entered_event(position=position, occurred_at=latest_bar.timestamp)
             open_symbols.add(setup.symbol)
             opened_count += 1
 
@@ -891,13 +1381,25 @@ class InMemoryStore:
         position: PortfolioPosition,
         exit_price: float,
         closed_at: datetime,
+        close_reason: str,
     ) -> None:
         position.last_price = exit_price
         position.status = PositionStatus.CLOSED
         position.closed_at = closed_at
         self.cash_balance += exit_price * position.quantity
+        self._record_position_closed_event(
+            position=position,
+            occurred_at=closed_at,
+            exit_price=exit_price,
+            close_reason=close_reason,
+        )
 
     def _enrich_setup(self, setup: SetupCandidate) -> SetupCandidate:
+        strategy_score = self.strategy_scores.get(setup.strategy_id)
+        if strategy_score is not None:
+            setup.wf_window_count = strategy_score.walk_forward_window_count
+            setup.wf_win_rate = round(strategy_score.win_rate * 100, 2)
+            setup.wf_total_return_pct = round(strategy_score.total_return * 100, 2)
         if not setup.thesis:
             setup.thesis = self._build_setup_thesis(setup)
         return setup
@@ -909,13 +1411,18 @@ class InMemoryStore:
         cluster_label = setup.cluster_id
         if cluster is not None:
             cluster_label = f"{cluster.sector} / {cluster.vol_bucket}"
-        trend = strategy.trend_indicator if strategy else "trend"
-        momentum = strategy.momentum_indicator if strategy else "momentum"
-        volume = strategy.volume_indicator if strategy else "hacim"
-        return (
-            f"{family_label} stratejisi {cluster_label} kumesinde one cikti. "
-            f"{trend}, {momentum} ve {volume} birlikte onay verdi; "
-            f"uyum {setup.confluence_score:.2f}, skor {setup.score:.2f} ve beklenen getiri {setup.expected_r:.2f}R."
+        return build_setup_thesis(
+            family_label=family_label,
+            cluster_label=cluster_label,
+            trend_indicator=(strategy.trend_indicator if strategy else "trend"),
+            momentum_indicator=(strategy.momentum_indicator if strategy else "momentum"),
+            volume_indicator=(strategy.volume_indicator if strategy else "hacim"),
+            confluence_score=setup.confluence_score,
+            score=setup.score,
+            expected_r=setup.expected_r,
+            wf_window_count=setup.wf_window_count,
+            wf_win_rate=setup.wf_win_rate,
+            wf_total_return_pct=setup.wf_total_return_pct,
         )
 
     def _build_position_entry_reason(
@@ -924,37 +1431,56 @@ class InMemoryStore:
         setup: SetupCandidate,
         fill_price: float,
     ) -> str:
-        return (
-            f"{self._build_setup_thesis(setup)} "
-            f"Bot pozisyona {fill_price:.2f} seviyesinden girdi; "
-            f"stop {setup.stop:.2f}, hedef {setup.target:.2f} olarak yerlestirildi."
+        return build_position_entry_reason(
+            base_thesis=self._build_setup_thesis(setup),
+            entry_price=fill_price,
+            stop_price=setup.stop,
+            target_price=setup.target,
+            expected_r_at_entry=setup.expected_r,
+            confidence_at_entry=normalize_probability(setup.confidence),
         )
 
-    def _backfill_position_reasons(self) -> None:
+    @staticmethod
+    def _normalize_probability(probability: float | None) -> float | None:
+        return normalize_probability(probability)
+
+    @staticmethod
+    def _format_probability_pct(probability: float | None) -> float | None:
+        return format_probability_pct(probability)
+
+    def _find_related_setup_for_symbol(self, symbol: str) -> SetupCandidate | None:
+        normalized_symbol = symbol.upper()
+        for preferred_status in (
+            SetupStatus.ENTERED,
+            SetupStatus.APPROVED_PENDING_ENTRY,
+            SetupStatus.ACTIVE,
+        ):
+            for setup in self.setups.values():
+                if setup.symbol == normalized_symbol and setup.status == preferred_status:
+                    return self._enrich_setup(setup)
+        return None
+
+    def _resolve_position_success_probability(
+        self,
+        *,
+        setup: SetupCandidate | None = None,
+        symbol: str | None = None,
+    ) -> float | None:
+        related_setup = setup
+        if related_setup is None and symbol is not None:
+            related_setup = self._find_related_setup_for_symbol(symbol)
+        if related_setup is None:
+            return None
+        return self._normalize_probability(related_setup.confidence)
+
+    def _backfill_position_metadata(self) -> None:
         if not self.positions:
             return
         for position in self.positions.values():
-            if position.entry_reason:
-                continue
-            related_setup = next(
-                (
-                    setup
-                    for setup in self.setups.values()
-                    if setup.symbol == position.symbol
-                ),
-                None,
-            )
-            if related_setup is not None:
-                related_setup = self._enrich_setup(related_setup)
-                position.entry_reason = self._build_position_entry_reason(
-                    setup=related_setup,
-                    fill_price=position.entry_price,
-                )
-                continue
-            position.entry_reason = (
-                f"Bot bu pozisyonu {position.sector} grubunda {position.entry_price:.2f} seviyesinden acti; "
-                f"stop {position.stop_price:.2f} ve hedef {position.target_price:.2f} ile risk/odul dengesi kuruldu."
-            )
+            related_setup = self._resolve_related_setup_for_position(position)
+            self._hydrate_position_entry_context(position, related_setup=related_setup)
+            view = self._build_position_view(position)
+            position.entry_reason = str(view["entry_reason"])
 
     def _bootstrap_paper_portfolio(self) -> None:
         if not self.settings.auto_paper_trading_enabled:
@@ -1007,7 +1533,12 @@ class InMemoryStore:
                         for strategy_id in self.cluster_active_strategy_ids.get(cluster_id, [])
                         if self._is_visible_strategy(strategy_id)
                     ],
+                    "backtest_mode": "walk_forward",
                     "strategy_count": len(strategies),
+                    "walk_forward_window_count": max(
+                        (score.walk_forward_window_count for score in strategies),
+                        default=0,
+                    ),
                 }
             )
         return cluster_rows
@@ -1058,6 +1589,8 @@ class InMemoryStore:
                 "profit_factor": round(score.profit_factor, 2),
                 "max_drawdown": round(score.max_drawdown * 100, 2),
                 "trade_count": score.trade_count,
+                "walk_forward_window_count": score.walk_forward_window_count,
+                "backtest_mode": score.backtest_mode,
             }
 
         return {
@@ -1067,67 +1600,67 @@ class InMemoryStore:
 
     def get_dashboard_page_data(self) -> dict[str, object]:
         self._refresh_open_positions_if_due()
-        market_watchlist = self.get_market_watchlist()
+        market_watchlist_views = self.get_market_watchlist()
         available_symbols = self.list_available_symbols()
-        top_setups = self.list_top_setups()
-        positions = self.list_positions()
-        open_positions = [position for position in positions if position.status == PositionStatus.OPEN]
-        pending_setups = [
-            setup
+        top_setup_views = self.list_top_setup_views()
+        top_setups = [setup for setup in top_setup_views if not bool(setup["is_degraded"])]
+        position_views = self.list_position_views()
+        paper_trade_history_views = self.list_paper_trade_history()
+        open_positions = [
+            position
+            for position in position_views
+            if position["status"] == PositionStatus.OPEN.value
+        ]
+        visible_positions = [position for position in open_positions if not bool(position["is_degraded"])]
+        visible_paper_trade_history = [
+            position
+            for position in paper_trade_history_views
+            if not bool(position["is_degraded"])
+        ]
+        pending_setup_views = [
+            self._build_setup_view(setup, now=datetime.now(UTC))
             for setup in self.setups.values()
             if setup.status == SetupStatus.APPROVED_PENDING_ENTRY
         ]
+        visible_pending_setups = [
+            setup for setup in pending_setup_views if not bool(setup["is_degraded"])
+        ]
+        visible_market_watchlist = [
+            row for row in market_watchlist_views if not bool(row["is_degraded"])
+        ]
         featured_symbol = (
-            (market_watchlist[0]["symbol"] if market_watchlist else None)
-            or (open_positions[0].symbol if open_positions else None)
+            (visible_market_watchlist[0]["symbol"] if visible_market_watchlist else None)
+            or (visible_positions[0]["symbol"] if visible_positions else None)
             or (available_symbols[0] if available_symbols else None)
+        )
+        available_paper_trade_symbols = self._list_paper_trade_symbols()
+        featured_paper_trade_symbol = (
+            (visible_paper_trade_history[0]["symbol"] if visible_paper_trade_history else None)
+            or (available_paper_trade_symbols[0] if available_paper_trade_symbols else None)
+            or (visible_positions[0]["symbol"] if visible_positions else None)
         )
         return {
             "overview": asdict(self.get_dashboard_overview()),
-            "market_watchlist": market_watchlist,
-            "top_setups": [
-                {
-                    **asdict(setup),
-                    "strategy_name": self.strategies.get(setup.strategy_id, StrategyDefinition(
-                        id=setup.strategy_id,
-                        name=setup.strategy_id,
-                        family=setup.strategy_family,
-                        trend_indicator="",
-                        momentum_indicator="",
-                        volume_indicator="",
-                    )).name,
-                    "strategy_family_label": self._family_label(setup.strategy_family),
-                    "sector": self.symbol_sectors.get(setup.symbol, "unknown"),
-                    "risk_reward": round((setup.target - setup.entry_high) / (setup.entry_high - setup.stop), 2),
-                    "thesis": setup.thesis,
-                    "expires_in_hours": round(
-                        max((setup.expires_at - datetime.now(UTC)).total_seconds(), 0) / 3600,
-                        1,
-                    ),
-                }
-                for setup in top_setups
-            ],
-            "positions": [asdict(position) for position in open_positions],
-            "pending_setups": [
-                {
-                    **asdict(setup),
-                    "strategy_name": self.strategies.get(setup.strategy_id, StrategyDefinition(
-                        id=setup.strategy_id,
-                        name=setup.strategy_id,
-                        family=setup.strategy_family,
-                        trend_indicator="",
-                        momentum_indicator="",
-                        volume_indicator="",
-                    )).name,
-                    "strategy_family_label": self._family_label(setup.strategy_family),
-                }
-                for setup in pending_setups
-            ],
+            "market_watchlist": visible_market_watchlist,
+            "market_watchlist_hidden_count": len(market_watchlist_views) - len(visible_market_watchlist),
+            "top_setups": top_setups,
+            "top_setups_hidden_count": len(top_setup_views) - len(top_setups),
+            "positions": visible_positions,
+            "positions_hidden_count": len(open_positions) - len(visible_positions),
+            "paper_trade_history": visible_paper_trade_history[:8],
+            "paper_trade_history_hidden_count": (
+                len(paper_trade_history_views) - len(visible_paper_trade_history)
+            ),
+            "pending_setups": visible_pending_setups,
+            "pending_setups_hidden_count": len(pending_setup_views) - len(visible_pending_setups),
             "live_trade_charts": self.get_live_trade_charts(),
             "available_symbols": available_symbols,
             "featured_symbol": featured_symbol,
+            "available_paper_trade_symbols": available_paper_trade_symbols,
+            "featured_paper_trade_symbol": featured_paper_trade_symbol,
             "research_cached_at": self.research_cached_at.isoformat() if self.research_cached_at else None,
             "strategy_insights": self.get_strategy_insights(),
+            "recent_lifecycle_events": self.get_lifecycle_events(limit=8),
         }
 
     def get_backtest_page_data(self) -> dict[str, object]:
@@ -1153,6 +1686,8 @@ class InMemoryStore:
                             "win_rate": round(score.win_rate * 100, 2),
                             "profit_factor": round(score.profit_factor, 2),
                             "max_drawdown": round(score.max_drawdown * 100, 2),
+                            "walk_forward_window_count": score.walk_forward_window_count,
+                            "backtest_mode": score.backtest_mode,
                         }
                         for score in strategies[:3]
                     ],
@@ -1190,49 +1725,216 @@ class InMemoryStore:
         for position in self.positions.values():
             if position.status != PositionStatus.OPEN:
                 continue
+            position_view = self._build_position_view(position)
+            if bool(position_view["is_degraded"]):
+                continue
             bars = self._fetch_live_trade_bars(position)
             if not bars:
                 continue
-            chart = build_candlestick_chart(
-                symbol=position.symbol,
-                title=f"{position.symbol} Canli Islem",
-                subtitle="Gercek BIST 1 saatlik mumlar, giris, canli fiyat, stop ve hedef",
-                bars=bars,
-                markers=[
-                    build_price_marker(
-                        timestamp=position.opened_at,
-                        text=f"Entry {position.entry_price:.2f}",
-                        color="#0d8a76",
-                        shape="arrowUp",
-                        position="belowBar",
-                    ),
-                    build_price_marker(
-                        timestamp=bars[-1].timestamp,
-                        text=f"Live {bars[-1].close:.2f}",
-                        color="#1d2430",
-                        shape="circle",
-                        position="aboveBar",
-                    ),
-                ],
-                price_lines=[
-                    build_price_line(
-                        value=position.stop_price,
-                        title=f"Stop {position.stop_price:.2f}",
-                        color="#b33c2b",
-                    ),
-                    build_price_line(
-                        value=position.target_price,
-                        title=f"Target {position.target_price:.2f}",
-                        color="#b57a18",
-                    ),
-                ],
+            chart = sanitize_chart_payload(
+                build_candlestick_chart(
+                    symbol=position.symbol,
+                    title=f"{position.symbol} Canli Islem",
+                    subtitle="Gercek BIST 1 saatlik mumlar, giris, canli fiyat, stop ve hedef",
+                    bars=bars,
+                    markers=[
+                        build_price_marker(
+                            timestamp=position.opened_at,
+                            text=f"Entry {float(position_view['entry_price']):.2f}",
+                            color="#0d8a76",
+                            shape="arrowUp",
+                            position="belowBar",
+                        ),
+                        build_price_marker(
+                            timestamp=bars[-1].timestamp,
+                            text=f"Live {bars[-1].close:.2f}",
+                            color="#1d2430",
+                            shape="circle",
+                            position="aboveBar",
+                        ),
+                    ],
+                    price_lines=[
+                        build_price_line(
+                            value=float(position_view["stop_price"]),
+                            title=f"Stop {float(position_view['stop_price']):.2f}",
+                            color="#b33c2b",
+                        ),
+                        build_price_line(
+                            value=float(position_view["target_price"]),
+                            title=f"Target {float(position_view['target_price']):.2f}",
+                            color="#b57a18",
+                        ),
+                    ],
+                )
             )
+            if bool(chart["is_degraded"]) or not chart["candles"]:
+                continue
             chart["data_source"] = "Yahoo Finance (.IS)"
             chart["quantity"] = position.quantity
             chart["opened_at"] = position.opened_at.isoformat()
-            chart["entry_reason"] = position.entry_reason
+            chart["entry_reason"] = position_view["entry_reason"]
             charts.append(chart)
         return charts
+
+    def get_paper_trade_symbol_chart(self, symbol: str) -> dict[str, object] | None:
+        self._refresh_open_positions_if_due()
+        normalized_symbol = symbol.upper()
+        symbol_positions = [
+            position
+            for position in self.positions.values()
+            if position.symbol == normalized_symbol
+        ]
+        if not symbol_positions:
+            return None
+
+        bars = self._get_symbol_daily_bars(
+            normalized_symbol,
+            lookback_days=self.settings.market_chart_lookback_days,
+            force_refresh=any(position.status == PositionStatus.OPEN for position in symbol_positions),
+        )
+        if not bars:
+            return None
+
+        markers: list[dict[str, object]] = []
+        price_lines: list[dict[str, object]] = []
+        hidden_positions = 0
+        open_trade_count = 0
+        closed_trade_count = 0
+        realized_pnl = 0.0
+        compounded_realized_return = 1.0
+        strategy_names: set[str] = set()
+
+        for position in sorted(symbol_positions, key=lambda item: item.opened_at):
+            related_setup = self._resolve_related_setup_for_position(position)
+            if related_setup is not None:
+                strategy = self.strategies.get(related_setup.strategy_id)
+                if strategy is not None:
+                    strategy_names.add(strategy.name)
+
+            position_view = self._build_position_view(position)
+            if bool(position_view["is_degraded"]):
+                hidden_positions += 1
+                continue
+
+            entry_price = float(position_view["entry_price"])
+            markers.append(
+                build_price_marker(
+                    timestamp=position.opened_at,
+                    text=f"Giris {entry_price:.2f}",
+                    color="#0d8a76",
+                    shape="arrowUp",
+                    position="belowBar",
+                )
+            )
+
+            if position.status == PositionStatus.CLOSED and position.closed_at is not None:
+                closed_trade_count += 1
+                exit_price = float(position_view["last_price"])
+                markers.append(
+                    build_price_marker(
+                        timestamp=position.closed_at,
+                        text=f"Cikis {exit_price:.2f}",
+                        color="#d26d3d",
+                        shape="arrowDown",
+                        position="aboveBar",
+                    )
+                )
+                if float(position_view["entry_price"]) > 0 and position_view["quantity"] is not None:
+                    trade_return = (
+                        (float(position_view["last_price"]) - float(position_view["entry_price"]))
+                        / float(position_view["entry_price"])
+                    )
+                    compounded_realized_return *= 1 + trade_return
+                    realized_pnl += (
+                        (float(position_view["last_price"]) - float(position_view["entry_price"]))
+                        * int(position_view["quantity"])
+                    )
+                continue
+
+            open_trade_count += 1
+            markers.append(
+                build_price_marker(
+                    timestamp=bars[-1].timestamp,
+                    text=f"Acik {bars[-1].close:.2f}",
+                    color="#1d2430",
+                    shape="circle",
+                    position="aboveBar",
+                )
+            )
+            if position_view["stop_price"] is not None:
+                price_lines.append(
+                    build_price_line(
+                        value=float(position_view["stop_price"]),
+                        title=f"Stop {float(position_view['stop_price']):.2f}",
+                        color="#b33c2b",
+                    )
+                )
+            if position_view["target_price"] is not None:
+                price_lines.append(
+                    build_price_line(
+                        value=float(position_view["target_price"]),
+                        title=f"Hedef {float(position_view['target_price']):.2f}",
+                        color="#b57a18",
+                    )
+                )
+
+        if not markers:
+            return None
+
+        chart = sanitize_chart_payload(
+            build_candlestick_chart(
+                symbol=normalized_symbol,
+                title=f"{normalized_symbol} Paper Trade Grafigi",
+                subtitle=(
+                    "Paper-trading giris/cikis isaretleri ve acik pozisyon katmanlari "
+                    f"({bars[-1].timeframe.upper()})"
+                ),
+                bars=bars[-self._backtest_chart_bar_limit(bars[-1].timeframe):],
+                markers=markers,
+                price_lines=price_lines,
+            )
+        )
+        if bool(chart["is_degraded"]) or not chart["candles"]:
+            return None
+        chart["data_source"] = f"Yahoo Finance (.IS) · {bars[-1].timeframe.upper()}"
+        chart["paper_trade_count"] = open_trade_count + closed_trade_count
+        chart["open_trade_count"] = open_trade_count
+        chart["closed_trade_count"] = closed_trade_count
+        chart["realized_pnl"] = round(realized_pnl, 2)
+        chart["realized_return_pct"] = (
+            round((compounded_realized_return - 1) * 100, 2)
+            if closed_trade_count
+            else 0.0
+        )
+        chart["strategy_name"] = ", ".join(sorted(strategy_names)[:3]) if strategy_names else "Paper Trade"
+        chart["filtered_position_overlay_count"] = hidden_positions
+        chart["entered_at"] = min(position.opened_at for position in symbol_positions).isoformat()
+        chart["last_activity_at"] = max(
+            (
+                position.closed_at if position.closed_at is not None else position.opened_at
+                for position in symbol_positions
+            )
+        ).isoformat()
+        return chart
+
+    def _list_paper_trade_symbols(self) -> list[str]:
+        latest_activity: dict[str, datetime] = {}
+        for position in self.positions.values():
+            position_view = self._build_position_view(position)
+            if bool(position_view["is_degraded"]):
+                continue
+            activity_at = position.closed_at or position.opened_at
+            previous = latest_activity.get(position.symbol)
+            if previous is None or activity_at > previous:
+                latest_activity[position.symbol] = activity_at
+        return [
+            symbol
+            for symbol, _ in sorted(
+                latest_activity.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ]
 
     def get_market_watchlist(self, *, limit: int = 6) -> list[dict[str, object]]:
         if self.market_data_provider is None:
@@ -1247,19 +1949,20 @@ class InMemoryStore:
                 continue
             last_bar = bars[-1]
             prev_close = bars[-2].close
-            if prev_close <= 0:
-                continue
-            change_pct = ((last_bar.close - prev_close) / prev_close) * 100
             rows.append(
-                {
-                    "symbol": symbol,
-                    "sector": self.symbol_sectors.get(symbol, "unknown"),
-                    "close": round(last_bar.close, 2),
-                    "change_pct": round(change_pct, 2),
-                    "high": round(last_bar.high, 2),
-                    "low": round(last_bar.low, 2),
-                    "volume": int(last_bar.volume),
-                }
+                build_watchlist_row_view(
+                    symbol=symbol,
+                    sector=self.symbol_sectors.get(symbol, "unknown"),
+                    close=round(last_bar.close, 2) if is_finite_number(last_bar.close) else last_bar.close,
+                    change_pct=(
+                        round(((last_bar.close - prev_close) / prev_close) * 100, 2)
+                        if is_finite_number(prev_close) and float(prev_close) > 0 and is_finite_number(last_bar.close)
+                        else None
+                    ),
+                    high=round(last_bar.high, 2) if is_finite_number(last_bar.high) else last_bar.high,
+                    low=round(last_bar.low, 2) if is_finite_number(last_bar.low) else last_bar.low,
+                    volume=last_bar.volume,
+                )
             )
         return rows
 
@@ -1299,6 +2002,7 @@ class InMemoryStore:
                 {
                     "symbol": symbol,
                     "sector": self.symbol_sectors.get(symbol, "unknown"),
+                    "backtest_mode": "walk_forward",
                     "trade_count": len(trades),
                     "strategy_count": len(strategies_by_symbol.get(symbol, set())),
                     "total_return_pct": round((compounded - 1) * 100, 2),
@@ -1307,6 +2011,14 @@ class InMemoryStore:
                         fmean(trade.r_multiple for trade in trades if trade.r_multiple is not None),
                         2,
                     ) if trades else 0.0,
+                    "walk_forward_window_count": max(
+                        (
+                            self.strategy_scores[strategy_id].walk_forward_window_count
+                            for strategy_id in strategies_by_symbol.get(symbol, set())
+                            if strategy_id in self.strategy_scores
+                        ),
+                        default=0,
+                    ),
                     "last_trade_at": max(trade.exited_at for trade in trades).isoformat(),
                 }
             )
@@ -1384,14 +2096,17 @@ class InMemoryStore:
         for trade in symbol_trades:
             compounded *= 1 + trade.return_pct
 
-        chart = build_candlestick_chart(
+        chart = sanitize_chart_payload(
+            build_candlestick_chart(
             symbol=normalized_symbol,
-            title=f"{normalized_symbol} 2 Yillik Backtest",
-            subtitle=f"Secilen hisse icin tum stratejilerden olusan tarihsel giris ve cikislar ({bars[-1].timeframe.upper()})",
+            title=f"{normalized_symbol} Walk-Forward OOS Backtest",
+            subtitle=f"Secilen hisse icin test pencerelerinden olusan OOS giris ve cikislar ({bars[-1].timeframe.upper()})",
             bars=bars[-self._backtest_chart_bar_limit(bars[-1].timeframe):],
             markers=markers,
+            )
         )
         chart["data_source"] = f"Yahoo Finance (.IS) · {bars[-1].timeframe.upper()}"
+        chart["backtest_mode"] = "walk_forward"
         chart["return_pct"] = round((compounded - 1) * 100, 2)
         chart["r_multiple"] = round(
             fmean(trade.r_multiple for trade in symbol_trades if trade.r_multiple is not None),
@@ -1399,6 +2114,15 @@ class InMemoryStore:
         ) if symbol_trades else 0.0
         chart["trade_count"] = len(symbol_trades)
         chart["strategy_count"] = len(strategy_names)
+        chart["walk_forward_window_count"] = max(
+            (
+                self.strategy_scores[strategy_id].walk_forward_window_count
+                for strategy_id in self.backtest_trades
+                if strategy_id in self.strategy_scores
+                and any(trade.symbol == normalized_symbol for trade in self.backtest_trades.get(strategy_id, []))
+            ),
+            default=0,
+        )
         chart["strategy_name"] = ", ".join(sorted(strategy_names)[:3])
         chart["entered_at"] = symbol_trades[0].entered_at.isoformat()
         chart["exited_at"] = symbol_trades[-1].exited_at.isoformat()
@@ -1522,6 +2246,7 @@ class InMemoryStore:
         return setup
 
     def _apply_research_result(self, result) -> None:
+        previous_setup_ids = set(self.setups)
         self.symbol_sectors = result.symbol_sectors
         self.bars_by_symbol = result.bars_by_symbol
         self.clusters = result.clusters
@@ -1530,7 +2255,10 @@ class InMemoryStore:
         self.cluster_active_strategy_ids = result.cluster_active_strategy_ids
         self.backtest_trades = result.backtest_trades
         self.setups = {setup.id: self._enrich_setup(setup) for setup in result.setups}
-        self._backfill_position_reasons()
+        self._record_setup_created_events(
+            [setup for setup_id, setup in self.setups.items() if setup_id not in previous_setup_ids]
+        )
+        self._backfill_position_metadata()
         self.research_cached_at = datetime.now(UTC)
         self._real_data_loaded = True
         self._real_data_attempted = True
@@ -1558,6 +2286,11 @@ class InMemoryStore:
                     last_price=float(item["last_price"]),
                     opened_at=datetime.fromisoformat(item["opened_at"]),
                     entry_reason=str(item.get("entry_reason", "")),
+                    success_probability=(
+                        self._normalize_probability(item["success_probability"])
+                        if item.get("success_probability") is not None
+                        else None
+                    ),
                     closed_at=datetime.fromisoformat(item["closed_at"]) if item.get("closed_at") else None,
                     adjustment_factor=float(item.get("adjustment_factor", 1.0)),
                     adjusted_entry_price=float(item["adjusted_entry_price"]) if item.get("adjusted_entry_price") is not None else None,
@@ -1568,11 +2301,38 @@ class InMemoryStore:
                         if item.get("last_corporate_action_at")
                         else None
                     ),
+                    source_setup_id=str(item["source_setup_id"]) if item.get("source_setup_id") else None,
+                    initial_stop_price=float(item["initial_stop_price"]) if item.get("initial_stop_price") is not None else None,
+                    initial_target_price=float(item["initial_target_price"]) if item.get("initial_target_price") is not None else None,
+                    expected_r_at_entry=float(item["expected_r_at_entry"]) if item.get("expected_r_at_entry") is not None else None,
+                    confidence_at_entry=(
+                        normalize_probability(item["confidence_at_entry"])
+                        if item.get("confidence_at_entry") is not None
+                        else None
+                    ),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
             positions[position.id] = position
         self.positions = positions
+        lifecycle_events: list[LifecycleEvent] = []
+        for item in payload.get("lifecycle_events", []):
+            try:
+                lifecycle_events.append(
+                    LifecycleEvent(
+                        id=str(item["id"]),
+                        event_type=LifecycleEventType(str(item["event_type"])),
+                        occurred_at=datetime.fromisoformat(item["occurred_at"]),
+                        symbol=str(item["symbol"]) if item.get("symbol") else None,
+                        setup_id=str(item["setup_id"]) if item.get("setup_id") else None,
+                        position_id=str(item["position_id"]) if item.get("position_id") else None,
+                        details=dict(item.get("details", {})),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.lifecycle_events = lifecycle_events[-MAX_LIFECYCLE_EVENTS:]
+        self._event_sequence = len(self.lifecycle_events)
 
     def _persist_runtime_state(self) -> None:
         if self.disk_cache is None:
@@ -1592,6 +2352,7 @@ class InMemoryStore:
                     "last_price": position.last_price,
                     "opened_at": position.opened_at.isoformat(),
                     "entry_reason": position.entry_reason,
+                    "success_probability": position.success_probability,
                     "closed_at": position.closed_at.isoformat() if position.closed_at else None,
                     "adjustment_factor": position.adjustment_factor,
                     "adjusted_entry_price": position.adjusted_entry_price,
@@ -1602,8 +2363,25 @@ class InMemoryStore:
                         if position.last_corporate_action_at
                         else None
                     ),
+                    "source_setup_id": position.source_setup_id,
+                    "initial_stop_price": position.initial_stop_price,
+                    "initial_target_price": position.initial_target_price,
+                    "expected_r_at_entry": position.expected_r_at_entry,
+                    "confidence_at_entry": position.confidence_at_entry,
                 }
                 for position in self.positions.values()
+            ],
+            "lifecycle_events": [
+                {
+                    "id": event.id,
+                    "event_type": event.event_type.value,
+                    "occurred_at": event.occurred_at.isoformat(),
+                    "symbol": event.symbol,
+                    "setup_id": event.setup_id,
+                    "position_id": event.position_id,
+                    "details": event.details,
+                }
+                for event in self.lifecycle_events[-MAX_LIFECYCLE_EVENTS:]
             ],
         }
         self.disk_cache.save_runtime_state(payload)
@@ -1613,6 +2391,8 @@ class InMemoryStore:
             return
         payload = self.disk_cache.load_research_state()
         if not payload:
+            return
+        if payload.get("research_state_schema_version") != RESEARCH_STATE_SCHEMA_VERSION:
             return
         if payload.get("research_timeframe") != self.settings.research_timeframe:
             return
@@ -1666,6 +2446,8 @@ class InMemoryStore:
                 estimated_round_trip_cost=float(item["estimated_round_trip_cost"]),
                 oos_window_trade_counts=[int(value) for value in item.get("oos_window_trade_counts", [])],
                 oos_returns=[float(value) for value in item.get("oos_returns", [])],
+                walk_forward_window_count=int(item.get("walk_forward_window_count", 0)),
+                backtest_mode=str(item.get("backtest_mode", "walk_forward")),
                 normalized_return=float(item.get("normalized_return", 0.0)),
                 normalized_win_rate=float(item.get("normalized_win_rate", 0.0)),
                 normalized_profit_factor=float(item.get("normalized_profit_factor", 0.0)),
@@ -1711,6 +2493,9 @@ class InMemoryStore:
                 expected_r=float(item["expected_r"]),
                 created_at=datetime.fromisoformat(item["created_at"]),
                 expires_at=datetime.fromisoformat(item["expires_at"]),
+                wf_window_count=int(item.get("wf_window_count", 0)),
+                wf_win_rate=float(item.get("wf_win_rate", 0.0)),
+                wf_total_return_pct=float(item.get("wf_total_return_pct", 0.0)),
                 thesis=str(item.get("thesis", "")),
                 status=SetupStatus(str(item.get("status", SetupStatus.ACTIVE.value))),
                 invalidated_reason=str(item["invalidated_reason"]) if item.get("invalidated_reason") else None,
@@ -1718,13 +2503,14 @@ class InMemoryStore:
             for item in payload.get("setups", [])
         }
         self.setups = {setup_id: self._enrich_setup(setup) for setup_id, setup in self.setups.items()}
-        self._backfill_position_reasons()
+        self._backfill_position_metadata()
         self._real_data_loaded = bool(self.strategy_scores)
 
     def _persist_research_state(self) -> None:
         if self.disk_cache is None:
             return
         payload = {
+            "research_state_schema_version": RESEARCH_STATE_SCHEMA_VERSION,
             "cached_at": self.research_cached_at.isoformat() if self.research_cached_at else None,
             "research_timeframe": self.settings.research_timeframe,
             "symbol_sectors": self.symbol_sectors,
@@ -1768,6 +2554,8 @@ class InMemoryStore:
                     "estimated_round_trip_cost": score.estimated_round_trip_cost,
                     "oos_window_trade_counts": score.oos_window_trade_counts,
                     "oos_returns": score.oos_returns,
+                    "walk_forward_window_count": score.walk_forward_window_count,
+                    "backtest_mode": score.backtest_mode,
                     "normalized_return": score.normalized_return,
                     "normalized_win_rate": score.normalized_win_rate,
                     "normalized_profit_factor": score.normalized_profit_factor,
@@ -1810,6 +2598,9 @@ class InMemoryStore:
                     "expected_r": setup.expected_r,
                     "created_at": setup.created_at.isoformat(),
                     "expires_at": setup.expires_at.isoformat(),
+                    "wf_window_count": setup.wf_window_count,
+                    "wf_win_rate": setup.wf_win_rate,
+                    "wf_total_return_pct": setup.wf_total_return_pct,
                     "thesis": setup.thesis,
                     "status": setup.status.value,
                     "invalidated_reason": setup.invalidated_reason,
