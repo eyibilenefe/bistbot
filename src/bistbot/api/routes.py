@@ -37,12 +37,12 @@ def get_market_chart(request: Request, symbol: str):
 
 @router.get("/setups/top")
 def list_top_setups(request: Request):
-    return jsonable_encoder(get_store(request).list_top_setups())
+    return jsonable_encoder(get_store(request).list_top_setup_views())
 
 
 @router.get("/setups/{setup_id}")
 def get_setup(request: Request, setup_id: str):
-    setup = get_store(request).get_setup(setup_id)
+    setup = get_store(request).get_setup_view(setup_id)
     if setup is None:
         raise HTTPException(status_code=404, detail="Setup not found")
     return jsonable_encoder(setup)
@@ -68,8 +68,9 @@ def reject_setup_route(request: Request, setup_id: str):
 
 @router.post("/positions/manual-entry")
 def create_manual_entry(request: Request, payload: ManualEntryRequest):
+    store = get_store(request)
     try:
-        position = get_store(request).create_manual_position(
+        position = store.create_manual_position(
             setup_id=payload.setup_id,
             fill_price=payload.fill_price,
             filled_at=payload.filled_at,
@@ -79,7 +80,7 @@ def create_manual_entry(request: Request, payload: ManualEntryRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return jsonable_encoder(position)
+    return jsonable_encoder(store.get_position_view(position.id))
 
 
 @router.patch("/positions/{position_id}")
@@ -87,20 +88,28 @@ def update_position_route(request: Request, position_id: str, payload: PositionU
     store = get_store(request)
     if store.get_position(position_id) is None:
         raise HTTPException(status_code=404, detail="Position not found")
-    position = store.update_position(
-        position_id,
-        stop_price=payload.stop_price,
-        target_price=payload.target_price,
-        last_price=payload.last_price,
-        status=payload.status,
-        closed_at=payload.closed_at,
-    )
-    return jsonable_encoder(position)
+    try:
+        position = store.update_position(
+            position_id,
+            stop_price=payload.stop_price,
+            target_price=payload.target_price,
+            last_price=payload.last_price,
+            status=payload.status,
+            closed_at=payload.closed_at,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return jsonable_encoder(store.get_position_view(position.id))
 
 
 @router.get("/positions")
 def list_positions(request: Request):
-    return jsonable_encoder(get_store(request).list_positions())
+    return jsonable_encoder(get_store(request).list_position_views())
+
+
+@router.get("/events/lifecycle")
+def list_lifecycle_events(request: Request, limit: int = 20):
+    return jsonable_encoder(get_store(request).get_lifecycle_events(limit=limit))
 
 
 @router.get("/backtests/clusters")

@@ -49,6 +49,9 @@
         <h2>Gercek piyasa ozeti</h2>
       </div>
     </div>
+    {% if market_watchlist_hidden_count %}
+      <p class="panel-copy">{{ market_watchlist_hidden_count }} satir gecersiz veri nedeniyle gizlendi.</p>
+    {% endif %}
     <div class="table-wrap">
       <table>
         <thead>
@@ -146,6 +149,9 @@
         </div>
         <a class="ghost-link" href="/api/positions">Ham JSON</a>
       </div>
+      {% if positions_hidden_count %}
+        <p class="panel-copy">{{ positions_hidden_count }} pozisyon gecersiz veri nedeniyle tabloda gizlendi.</p>
+      {% endif %}
       <div class="table-wrap">
         <table>
           <thead>
@@ -222,6 +228,26 @@
         </div>
       </div>
     </section>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Lifecycle Kaydi</p>
+        <h2>Son olaylar</h2>
+      </div>
+      <a class="ghost-link" href="/api/events/lifecycle">Ham JSON</a>
+    </div>
+    <ul class="insight-list">
+      {% for event in recent_lifecycle_events %}
+        <li>
+          <strong>{{ event.message }}</strong>
+          <span>{{ event.occurred_at }}</span>
+        </li>
+      {% else %}
+        <li><span>Henuz lifecycle olayi kaydi yok.</span></li>
+      {% endfor %}
+    </ul>
   </section>
 
   <section class="panel">

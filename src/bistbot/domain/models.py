@@ -8,6 +8,7 @@ from bistbot.domain.enums import (
     ClusterFallbackMode,
     CorporateActionType,
     DataQualityEventType,
+    LifecycleEventType,
     PositionStatus,
     SetupStatus,
     StrategyFamily,
@@ -127,6 +128,11 @@ class PortfolioPosition:
     adjusted_stop_price: float | None = None
     adjusted_target_price: float | None = None
     last_corporate_action_at: datetime | None = None
+    source_setup_id: str | None = None
+    initial_stop_price: float | None = None
+    initial_target_price: float | None = None
+    expected_r_at_entry: float | None = None
+    confidence_at_entry: float | None = None
 
 
 @dataclass(slots=True)
@@ -177,6 +183,17 @@ class JobRun:
     started_at: datetime
     completed_at: datetime
     status: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class LifecycleEvent:
+    id: str
+    event_type: LifecycleEventType
+    occurred_at: datetime
+    symbol: str | None = None
+    setup_id: str | None = None
+    position_id: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
 
