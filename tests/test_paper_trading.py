@@ -150,3 +150,63 @@ def test_open_positions_are_refreshed_with_fresh_market_data() -> None:
     position = store.positions["pos-1"]
     assert position.last_price == 220.5
     assert any(provider.force_refresh_calls)
+
+
+def test_closed_paper_trade_history_and_chart_are_built() -> None:
+    settings = get_settings()
+    store = InMemoryStore(settings, seed_demo_data=True)
+    close_time = datetime(2026, 3, 26, 14, tzinfo=UTC)
+    store.bars_by_symbol = {
+        "KCHOL": [
+            PriceBar(
+                symbol="KCHOL",
+                timestamp=datetime(2026, 3, 20, tzinfo=UTC),
+                open=208.5,
+                high=210.2,
+                low=207.8,
+                close=209.8,
+                volume=15_000,
+                timeframe="1d",
+            ),
+            PriceBar(
+                symbol="KCHOL",
+                timestamp=datetime(2026, 3, 24, tzinfo=UTC),
+                open=210.2,
+                high=214.4,
+                low=209.9,
+                close=213.8,
+                volume=18_000,
+                timeframe="1d",
+            ),
+            PriceBar(
+                symbol="KCHOL",
+                timestamp=close_time,
+                open=214.1,
+                high=216.0,
+                low=213.2,
+                close=215.5,
+                volume=19_000,
+                timeframe="1d",
+            ),
+        ]
+    }
+
+    store.update_position(
+        "pos-1",
+        last_price=215.5,
+        status=PositionStatus.CLOSED.value,
+        closed_at=close_time,
+    )
+
+    history = store.list_paper_trade_history()
+
+    assert history[0]["id"] == "pos-1"
+    assert history[0]["close_reason"] == "Manuel kapama"
+    assert history[0]["realized_return_pct"] is not None
+
+    chart = store.get_paper_trade_symbol_chart("KCHOL")
+
+    assert chart is not None
+    assert chart["closed_trade_count"] == 1
+    assert chart["paper_trade_count"] == 1
+    assert len(chart["markers"]) >= 2

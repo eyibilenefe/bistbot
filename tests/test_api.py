@@ -94,6 +94,14 @@ def test_dashboard_and_manual_entry_flow() -> None:
     assert entry_response.status_code == 200
     assert entry_response.json()["symbol"] == top_setups[0]["symbol"]
     assert entry_response.json()["success_probability"] == top_setups[0]["confidence"]
+    position_id = entry_response.json()["id"]
+
+    close_response = client.patch(
+        f"/api/positions/{position_id}",
+        json={"last_price": 22.4, "status": "closed"},
+    )
+    assert close_response.status_code == 200
+    assert close_response.json()["status"] == "closed"
 
     clusters_response = client.get("/api/backtests/clusters")
     assert clusters_response.status_code == 200
@@ -114,6 +122,15 @@ def test_dashboard_and_manual_entry_flow() -> None:
     assert len(backtest_symbol_chart_response.json()["candles"]) >= 1
     assert backtest_symbol_chart_response.json()["backtest_mode"] == "walk_forward"
 
+    paper_trade_history_response = client.get("/api/paper-trades/history")
+    assert paper_trade_history_response.status_code == 200
+    assert any(item["id"] == position_id for item in paper_trade_history_response.json())
+
+    paper_trade_chart_response = client.get(f"/api/paper-trades/symbols/{top_setups[0]['symbol']}")
+    assert paper_trade_chart_response.status_code == 200
+    assert len(paper_trade_chart_response.json()["candles"]) >= 1
+    assert paper_trade_chart_response.json()["paper_trade_count"] >= 1
+
 
 def test_html_dashboard_and_backtest_pages_render() -> None:
     client = build_client()
@@ -131,6 +148,9 @@ def test_html_dashboard_and_backtest_pages_render() -> None:
     assert "Yahoo Finance (.IS)" in dashboard_response.text
     assert "Neden Secildi" in dashboard_response.text
     assert "Giris Gerekcesi" in dashboard_response.text
+    assert "Gecmis islemler" in dashboard_response.text
+    assert "Paper Trade Haritasi" in dashboard_response.text
+    assert "Paper Trade Yukle" in dashboard_response.text
 
     backtest_response = client.get("/backtest")
     assert backtest_response.status_code == 200

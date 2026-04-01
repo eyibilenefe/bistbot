@@ -311,6 +311,69 @@ async function loadBacktestSymbolChart(symbol) {
   }
 }
 
+async function loadPaperTradeSymbolChart(symbol) {
+  const browser = document.querySelector('[data-paper-trade-browser]');
+  if (!browser) {
+    return;
+  }
+
+  const trimmedSymbol = (symbol || '').trim().toUpperCase();
+  const container = browser.querySelector('[data-paper-trade-chart-container]');
+  const status = browser.querySelector('[data-paper-trade-symbol-status]');
+  const title = browser.querySelector('[data-paper-trade-chart-title]');
+  const subtitle = browser.querySelector('[data-paper-trade-chart-subtitle]');
+  const meta = browser.querySelector('[data-paper-trade-chart-meta]');
+
+  if (!trimmedSymbol) {
+    if (status) {
+      status.textContent = 'Lutfen once bir paper trade hissesi sec.';
+    }
+    return;
+  }
+
+  if (status) {
+    status.textContent = `${trimmedSymbol} icin paper trade grafigi yukleniyor...`;
+  }
+  setLoadingVisible(true, `${trimmedSymbol} icin paper trade izleri aliniyor...`);
+  setLoadingProgress(20, `${trimmedSymbol} icin paper trade izleri aliniyor...`);
+  destroyChart(container);
+  container.innerHTML = '<div class="chart-empty">Paper trade grafigi hazirlaniyor...</div>';
+
+  try {
+    await ensureChartLibrary();
+    const response = await fetch(`/api/paper-trades/symbols/${encodeURIComponent(trimmedSymbol)}`);
+    if (!response.ok) {
+      throw new Error('not-found');
+    }
+    const payload = await response.json();
+    renderPayloadIntoContainer(container, payload);
+    if (title) {
+      title.textContent = payload.title || trimmedSymbol;
+    }
+    if (subtitle) {
+      subtitle.textContent = payload.subtitle || 'Paper trade giris/cikis izleri';
+    }
+    if (meta) {
+      meta.textContent = `${payload.paper_trade_count || 0} islem · ${payload.closed_trade_count || 0} kapanan · ${payload.realized_return_pct ?? 0}% gerceklesen getiri · ${payload.data_source || 'Veri yok'}`;
+    }
+    if (status) {
+      status.textContent = `${trimmedSymbol} paper trade grafigi yuklendi.`;
+    }
+    setLoadingProgress(100, `${trimmedSymbol} paper trade grafigi hazir.`);
+  } catch (error) {
+    destroyChart(container);
+    container.innerHTML = '<div class="chart-empty">Bu sembol icin paper trade grafigi bulunamadi.</div>';
+    if (status) {
+      status.textContent = `${trimmedSymbol} icin paper trade kaydi bulunamadi.`;
+    }
+    setLoadingProgress(100, `${trimmedSymbol} icin paper trade kaydi bulunamadi.`);
+  } finally {
+    window.setTimeout(() => {
+      setLoadingVisible(false);
+    }, 180);
+  }
+}
+
 function setupMarketBrowser() {
   const browser = document.querySelector('[data-market-browser]');
   if (!browser) {
@@ -363,6 +426,34 @@ function setupBacktestBrowser() {
 
   if (input.value) {
     return loadBacktestSymbolChart(input.value);
+  }
+  return Promise.resolve();
+}
+
+function setupPaperTradeBrowser() {
+  const browser = document.querySelector('[data-paper-trade-browser]');
+  if (!browser) {
+    return Promise.resolve();
+  }
+
+  const input = browser.querySelector('[data-paper-trade-symbol-input]');
+  const button = browser.querySelector('[data-paper-trade-symbol-load]');
+  if (!input || !button) {
+    return Promise.resolve();
+  }
+
+  button.addEventListener('click', () => {
+    loadPaperTradeSymbolChart(input.value);
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      loadPaperTradeSymbolChart(input.value);
+    }
+  });
+
+  if (input.value) {
+    return loadPaperTradeSymbolChart(input.value);
   }
   return Promise.resolve();
 }
@@ -426,6 +517,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderStaticCharts();
   setupRefreshButton();
   await setupMarketBrowser();
+  await setupPaperTradeBrowser();
   await setupBacktestBrowser();
   setLoadingProgress(100, 'Sayfa hazir.');
   setLoadingVisible(false);

@@ -611,6 +611,22 @@ class InMemoryStore:
         self._refresh_open_positions_if_due()
         return [self._build_position_view(position) for position in self.positions.values()]
 
+    def list_paper_trade_history(self, *, limit: int | None = None) -> list[dict[str, object]]:
+        self._refresh_open_positions_if_due()
+        rows = [
+            self._build_position_history_view(position)
+            for position in self.positions.values()
+            if position.status == PositionStatus.CLOSED
+        ]
+        rows.sort(
+            key=lambda item: (
+                item["closed_at"] or item["opened_at"],
+                item["opened_at"],
+            ),
+            reverse=True,
+        )
+        return rows[:limit] if limit is not None else rows
+
     def get_lifecycle_events(self, *, limit: int = 20) -> list[dict[str, object]]:
         ordered = sorted(self.lifecycle_events, key=lambda event: event.occurred_at, reverse=True)
         return [build_lifecycle_event_view(event) for event in ordered[:limit]]
@@ -664,6 +680,41 @@ class InMemoryStore:
         if position.expected_r_at_entry is None and view["expected_r_at_entry"] is not None:
             position.expected_r_at_entry = float(view["expected_r_at_entry"])
         return view
+
+    def _build_position_history_view(self, position: PortfolioPosition) -> dict[str, object]:
+        view = self._build_position_view(position)
+        exit_price = view["last_price"] if position.status == PositionStatus.CLOSED else None
+        realized_return_pct = None
+        realized_pnl = None
+        if (
+            position.status == PositionStatus.CLOSED
+            and view["entry_price"] is not None
+            and view["last_price"] is not None
+            and view["quantity"] is not None
+            and float(view["entry_price"]) > 0
+        ):
+            realized_return_pct = round(
+                ((float(view["last_price"]) - float(view["entry_price"])) / float(view["entry_price"])) * 100,
+                2,
+            )
+            realized_pnl = round(
+                (float(view["last_price"]) - float(view["entry_price"])) * int(view["quantity"]),
+                2,
+            )
+        holding_days = None
+        if position.closed_at is not None:
+            holding_days = round(
+                max((position.closed_at - position.opened_at).total_seconds(), 0.0) / 86400,
+                1,
+            )
+        return {
+            **view,
+            "exit_price": exit_price,
+            "realized_return_pct": realized_return_pct,
+            "realized_pnl": realized_pnl,
+            "holding_days": holding_days,
+            "close_reason": self._close_reason_label(self._find_position_close_reason(position.id)),
+        }
 
     def _resolve_related_setup_for_position(
         self,
@@ -847,6 +898,28 @@ class InMemoryStore:
                 "close_reason": close_reason,
             },
         )
+
+    def _find_position_close_reason(self, position_id: str) -> str | None:
+        for event in reversed(self.lifecycle_events):
+            if (
+                event.position_id == position_id
+                and event.event_type == LifecycleEventType.POSITION_CLOSED
+            ):
+                close_reason = event.details.get("close_reason")
+                return str(close_reason) if close_reason else None
+        return None
+
+    @staticmethod
+    def _close_reason_label(close_reason: str | None) -> str | None:
+        if close_reason is None:
+            return None
+        labels = {
+            "manual_close": "Manuel kapama",
+            "stop_hit": "Stop tetiklendi",
+            "target_hit": "Hedefe ulasildi",
+            "soft_limit_close": "Soft limit kapamasi",
+        }
+        return labels.get(close_reason, close_reason.replace("_", " ").strip().title())
 
     def list_top_setups(self, *, limit: int = 3) -> list[SetupCandidate]:
         self._ensure_real_research_data()
@@ -1532,12 +1605,18 @@ class InMemoryStore:
         top_setup_views = self.list_top_setup_views()
         top_setups = [setup for setup in top_setup_views if not bool(setup["is_degraded"])]
         position_views = self.list_position_views()
+        paper_trade_history_views = self.list_paper_trade_history()
         open_positions = [
             position
             for position in position_views
             if position["status"] == PositionStatus.OPEN.value
         ]
         visible_positions = [position for position in open_positions if not bool(position["is_degraded"])]
+        visible_paper_trade_history = [
+            position
+            for position in paper_trade_history_views
+            if not bool(position["is_degraded"])
+        ]
         pending_setup_views = [
             self._build_setup_view(setup, now=datetime.now(UTC))
             for setup in self.setups.values()
@@ -1554,6 +1633,12 @@ class InMemoryStore:
             or (visible_positions[0]["symbol"] if visible_positions else None)
             or (available_symbols[0] if available_symbols else None)
         )
+        available_paper_trade_symbols = self._list_paper_trade_symbols()
+        featured_paper_trade_symbol = (
+            (visible_paper_trade_history[0]["symbol"] if visible_paper_trade_history else None)
+            or (available_paper_trade_symbols[0] if available_paper_trade_symbols else None)
+            or (visible_positions[0]["symbol"] if visible_positions else None)
+        )
         return {
             "overview": asdict(self.get_dashboard_overview()),
             "market_watchlist": visible_market_watchlist,
@@ -1562,11 +1647,17 @@ class InMemoryStore:
             "top_setups_hidden_count": len(top_setup_views) - len(top_setups),
             "positions": visible_positions,
             "positions_hidden_count": len(open_positions) - len(visible_positions),
+            "paper_trade_history": visible_paper_trade_history[:8],
+            "paper_trade_history_hidden_count": (
+                len(paper_trade_history_views) - len(visible_paper_trade_history)
+            ),
             "pending_setups": visible_pending_setups,
             "pending_setups_hidden_count": len(pending_setup_views) - len(visible_pending_setups),
             "live_trade_charts": self.get_live_trade_charts(),
             "available_symbols": available_symbols,
             "featured_symbol": featured_symbol,
+            "available_paper_trade_symbols": available_paper_trade_symbols,
+            "featured_paper_trade_symbol": featured_paper_trade_symbol,
             "research_cached_at": self.research_cached_at.isoformat() if self.research_cached_at else None,
             "strategy_insights": self.get_strategy_insights(),
             "recent_lifecycle_events": self.get_lifecycle_events(limit=8),
@@ -1684,6 +1775,166 @@ class InMemoryStore:
             chart["entry_reason"] = position_view["entry_reason"]
             charts.append(chart)
         return charts
+
+    def get_paper_trade_symbol_chart(self, symbol: str) -> dict[str, object] | None:
+        self._refresh_open_positions_if_due()
+        normalized_symbol = symbol.upper()
+        symbol_positions = [
+            position
+            for position in self.positions.values()
+            if position.symbol == normalized_symbol
+        ]
+        if not symbol_positions:
+            return None
+
+        bars = self._get_symbol_daily_bars(
+            normalized_symbol,
+            lookback_days=self.settings.market_chart_lookback_days,
+            force_refresh=any(position.status == PositionStatus.OPEN for position in symbol_positions),
+        )
+        if not bars:
+            return None
+
+        markers: list[dict[str, object]] = []
+        price_lines: list[dict[str, object]] = []
+        hidden_positions = 0
+        open_trade_count = 0
+        closed_trade_count = 0
+        realized_pnl = 0.0
+        compounded_realized_return = 1.0
+        strategy_names: set[str] = set()
+
+        for position in sorted(symbol_positions, key=lambda item: item.opened_at):
+            related_setup = self._resolve_related_setup_for_position(position)
+            if related_setup is not None:
+                strategy = self.strategies.get(related_setup.strategy_id)
+                if strategy is not None:
+                    strategy_names.add(strategy.name)
+
+            position_view = self._build_position_view(position)
+            if bool(position_view["is_degraded"]):
+                hidden_positions += 1
+                continue
+
+            entry_price = float(position_view["entry_price"])
+            markers.append(
+                build_price_marker(
+                    timestamp=position.opened_at,
+                    text=f"Giris {entry_price:.2f}",
+                    color="#0d8a76",
+                    shape="arrowUp",
+                    position="belowBar",
+                )
+            )
+
+            if position.status == PositionStatus.CLOSED and position.closed_at is not None:
+                closed_trade_count += 1
+                exit_price = float(position_view["last_price"])
+                markers.append(
+                    build_price_marker(
+                        timestamp=position.closed_at,
+                        text=f"Cikis {exit_price:.2f}",
+                        color="#d26d3d",
+                        shape="arrowDown",
+                        position="aboveBar",
+                    )
+                )
+                if float(position_view["entry_price"]) > 0 and position_view["quantity"] is not None:
+                    trade_return = (
+                        (float(position_view["last_price"]) - float(position_view["entry_price"]))
+                        / float(position_view["entry_price"])
+                    )
+                    compounded_realized_return *= 1 + trade_return
+                    realized_pnl += (
+                        (float(position_view["last_price"]) - float(position_view["entry_price"]))
+                        * int(position_view["quantity"])
+                    )
+                continue
+
+            open_trade_count += 1
+            markers.append(
+                build_price_marker(
+                    timestamp=bars[-1].timestamp,
+                    text=f"Acik {bars[-1].close:.2f}",
+                    color="#1d2430",
+                    shape="circle",
+                    position="aboveBar",
+                )
+            )
+            if position_view["stop_price"] is not None:
+                price_lines.append(
+                    build_price_line(
+                        value=float(position_view["stop_price"]),
+                        title=f"Stop {float(position_view['stop_price']):.2f}",
+                        color="#b33c2b",
+                    )
+                )
+            if position_view["target_price"] is not None:
+                price_lines.append(
+                    build_price_line(
+                        value=float(position_view["target_price"]),
+                        title=f"Hedef {float(position_view['target_price']):.2f}",
+                        color="#b57a18",
+                    )
+                )
+
+        if not markers:
+            return None
+
+        chart = sanitize_chart_payload(
+            build_candlestick_chart(
+                symbol=normalized_symbol,
+                title=f"{normalized_symbol} Paper Trade Grafigi",
+                subtitle=(
+                    "Paper-trading giris/cikis isaretleri ve acik pozisyon katmanlari "
+                    f"({bars[-1].timeframe.upper()})"
+                ),
+                bars=bars[-self._backtest_chart_bar_limit(bars[-1].timeframe):],
+                markers=markers,
+                price_lines=price_lines,
+            )
+        )
+        if bool(chart["is_degraded"]) or not chart["candles"]:
+            return None
+        chart["data_source"] = f"Yahoo Finance (.IS) · {bars[-1].timeframe.upper()}"
+        chart["paper_trade_count"] = open_trade_count + closed_trade_count
+        chart["open_trade_count"] = open_trade_count
+        chart["closed_trade_count"] = closed_trade_count
+        chart["realized_pnl"] = round(realized_pnl, 2)
+        chart["realized_return_pct"] = (
+            round((compounded_realized_return - 1) * 100, 2)
+            if closed_trade_count
+            else 0.0
+        )
+        chart["strategy_name"] = ", ".join(sorted(strategy_names)[:3]) if strategy_names else "Paper Trade"
+        chart["filtered_position_overlay_count"] = hidden_positions
+        chart["entered_at"] = min(position.opened_at for position in symbol_positions).isoformat()
+        chart["last_activity_at"] = max(
+            (
+                position.closed_at if position.closed_at is not None else position.opened_at
+                for position in symbol_positions
+            )
+        ).isoformat()
+        return chart
+
+    def _list_paper_trade_symbols(self) -> list[str]:
+        latest_activity: dict[str, datetime] = {}
+        for position in self.positions.values():
+            position_view = self._build_position_view(position)
+            if bool(position_view["is_degraded"]):
+                continue
+            activity_at = position.closed_at or position.opened_at
+            previous = latest_activity.get(position.symbol)
+            if previous is None or activity_at > previous:
+                latest_activity[position.symbol] = activity_at
+        return [
+            symbol
+            for symbol, _ in sorted(
+                latest_activity.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ]
 
     def get_market_watchlist(self, *, limit: int = 6) -> list[dict[str, object]]:
         if self.market_data_provider is None:

@@ -107,6 +107,19 @@ def list_positions(request: Request):
     return jsonable_encoder(get_store(request).list_position_views())
 
 
+@router.get("/paper-trades/history")
+def list_paper_trade_history(request: Request, limit: int = 20):
+    return jsonable_encoder(get_store(request).list_paper_trade_history(limit=limit))
+
+
+@router.get("/paper-trades/symbols/{symbol}")
+def get_paper_trade_symbol_chart_route(request: Request, symbol: str):
+    chart = get_store(request).get_paper_trade_symbol_chart(symbol)
+    if chart is None:
+        raise HTTPException(status_code=404, detail="Paper trade symbol not found")
+    return jsonable_encoder(chart)
+
+
 @router.get("/events/lifecycle")
 def list_lifecycle_events(request: Request, limit: int = 20):
     return jsonable_encoder(get_store(request).get_lifecycle_events(limit=limit))
